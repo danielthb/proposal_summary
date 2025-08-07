@@ -561,9 +561,17 @@ class RailwayInsurancePipeline:
         if len(self.pdf_urls) < 2:
             raise ValueError("需要至少两个PDF文件URL")
         
-        # 设置临时文件路径
-        self.scheme1_pdf_path = os.path.join(self.temp_dir, f"scheme1_{os.path.basename(self.pdf_urls[0])}")
-        self.scheme2_pdf_path = os.path.join(self.temp_dir, f"scheme2_{os.path.basename(self.pdf_urls[1])}")
+        # 设置临时文件路径 - 使用安全的文件名
+        def safe_filename(url):
+            # 先提取基本文件名
+            base_name = os.path.basename(url.split('?')[0])
+            # 如果还包含非法字符，则生成随机文件名
+            if len(base_name) > 50 or not base_name.endswith('.pdf'):
+                return f"{uuid.uuid4().hex}.pdf"
+            return base_name
+            
+        self.scheme1_pdf_path = os.path.join(self.temp_dir, f"scheme1_{safe_filename(self.pdf_urls[0])}")
+        self.scheme2_pdf_path = os.path.join(self.temp_dir, f"scheme2_{safe_filename(self.pdf_urls[1])}")
         
         # 设置输出文件路径
         self.extracted_data_file = os.path.join(self.temp_dir, "计划书数据提取结果.xlsx")
@@ -609,15 +617,22 @@ class RailwayInsurancePipeline:
                     raise
             else:
                 # 普通HTTP URL
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(url, follow_redirects=True)
-                    response.raise_for_status()
-                    
-                    with open(local_path, 'wb') as f:
-                        f.write(response.content)
-                    
-                    print(f"下载PDF成功: {url} -> {local_path}")
-                    return True
+                try:
+                    async with httpx.AsyncClient() as client:
+                        response = await client.get(url, follow_redirects=True)
+                        response.raise_for_status()
+                        
+                        # 确保目标目录存在
+                        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                        
+                        with open(local_path, 'wb') as f:
+                            f.write(response.content)
+                        
+                        print(f"下载PDF成功: {url} -> {local_path}")
+                        return True
+                except Exception as e:
+                    logger.error(f"下载PDF失败: {url}, 错误: {e}")
+                    raise
         
         except Exception as e:
             logger.error(f"下载PDF失败: {url}, 错误: {e}")
@@ -1460,7 +1475,7 @@ class RailwayInsurancePipeline:
                 try:
                     self.supabase.table('tasks').update({
                         'status': 'failed',
-                        'error': str(e),
+                        'error_message': str(e),
                         'completed_at': datetime.now().isoformat()
                     }).eq('id', self.task_id).execute()
                     print(f"任务失败状态已更新到数据库: {self.task_id}")
