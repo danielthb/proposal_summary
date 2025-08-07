@@ -9,6 +9,7 @@ from flask import Flask, request, jsonify
 from railway_insurance_pipeline import process_insurance_pdfs
 import asyncio
 import logging
+import os
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -61,4 +62,5 @@ def process():
 
 if __name__ == '__main__':
     logger.info("正在启动保险方案分析API服务...")
-    app.run(host='0.0.0.0', port=8000)
+    port = int(os.environ.get('PORT', 8000))
+    app.run(host='0.0.0.0', port=port)
