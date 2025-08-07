@@ -1,0 +1,9 @@
+pdfplumber
+pandas
+numpy-financial
+playwright
+Pillow
+supabase
+httpx
+openpyxl
+flask
