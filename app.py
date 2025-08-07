@@ -31,25 +31,39 @@ def process():
         # 获取请求数据
         supabase_url = data.get('supabase_url')
         supabase_key = data.get('supabase_key')
-        scheme1_file_url = data.get('scheme1_file_url')
-        scheme2_file_url = data.get('scheme2_file_url')
+        pdf_urls = data.get('pdf_urls', [])
         task_id = data.get('task_id')
         
+        # 兼容旧的API接口
+        scheme1_file_url = data.get('scheme1_file_url')
+        scheme2_file_url = data.get('scheme2_file_url')
+        
+        # 如果使用旧接口，合并PDF URL
+        if scheme1_file_url and scheme2_file_url and not pdf_urls:
+            pdf_urls = [scheme1_file_url, scheme2_file_url]
+        
         # 验证必要参数
-        if not all([supabase_url, supabase_key, scheme1_file_url, scheme2_file_url, task_id]):
+        if not all([supabase_url, supabase_key, task_id]) or len(pdf_urls) < 2:
             logger.error(f"请求缺少必要参数: {data}")
-            return jsonify({"error": "缺少必要参数"}), 400
+            missing = []
+            if not supabase_url:
+                missing.append("supabase_url")
+            if not supabase_key:
+                missing.append("supabase_key")
+            if not task_id:
+                missing.append("task_id")
+            if len(pdf_urls) < 2:
+                missing.append("pdf_urls (至少需要2个)")
+            return jsonify({"error": f"缺少必要参数: {', '.join(missing)}"}), 400
         
         logger.info(f"开始处理任务 {task_id}")
-        logger.info(f"方案1文件: {scheme1_file_url}")
-        logger.info(f"方案2文件: {scheme2_file_url}")
+        logger.info(f"PDF文件: {pdf_urls}")
         
         # 异步处理PDF文件
         result = asyncio.run(process_insurance_pdfs(
+            pdf_urls=pdf_urls,
             supabase_url=supabase_url,
             supabase_key=supabase_key,
-            scheme1_file_url=scheme1_file_url,
-            scheme2_file_url=scheme2_file_url,
             task_id=task_id
         ))
         

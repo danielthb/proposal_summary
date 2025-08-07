@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Railway + Supabase 保险方案处理流水线
-=====================================
+Railway适用的保险方案处理流水线
+====================================
 
-基于 correct_complete_pipeline.py，修改为适配Railway + Supabase的版本：
-1. 从Supabase Storage下载PDF文件
-2. 将结果上传到Supabase Storage
-3. 保持所有处理逻辑不变
+基于correct_complete_pipeline.py修改，适配云环境：
+1. PDF从Supabase URL下载而不是本地文件系统
+2. 结果上传到Supabase而不是保存到本地文件系统
+3. 异步处理支持
 
 作者: MiniMax Agent
 日期: 2025-08-07
@@ -18,7 +18,7 @@ import pandas as pd
 import numpy as np
 import json
 import re
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional, Union
 import os
 from datetime import datetime
 import logging
@@ -30,10 +30,13 @@ import tempfile
 import shutil
 import asyncio
 import httpx
+import mimetypes
+import uuid
 
 # Playwright用于截图
 try:
     from playwright.sync_api import sync_playwright
+    from playwright.async_api import async_playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
@@ -41,18 +44,131 @@ except ImportError:
 
 # Supabase客户端
 try:
-    from supabase import create_client
+    from supabase import create_client, Client
     SUPABASE_AVAILABLE = True
 except ImportError:
     SUPABASE_AVAILABLE = False
-    print("警告: Supabase客户端未安装")
+    print("警告: Supabase客户端未安装，云存储功能将不可用")
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# 添加正确的IRR计算器类
+class CorrectedIRRCalculator:
+    """修正的IRR计算器（完全按照原脚本）"""
+    
+    @staticmethod
+    def calculate_irr(cash_flows: List[float], max_iterations: int = 1000, precision: float = 1e-6) -> float:
+        """计算内部收益率IRR（完全按照原脚本）"""
+        try:
+            # 使用numpy_financial计算IRR
+            irr = npf.irr(cash_flows)
+            
+            if np.isnan(irr) or np.isinf(irr):
+                # 如果numpy_financial失败，使用自定义算法
+                return CorrectedIRRCalculator._custom_irr(cash_flows, max_iterations, precision)
+            
+            return irr
+            
+        except Exception as e:
+            logger.warning(f"IRR计算失败: {e}")
+            return CorrectedIRRCalculator._custom_irr(cash_flows, max_iterations, precision)
+    
+    @staticmethod
+    def _custom_irr(cash_flows: List[float], max_iterations: int = 1000, precision: float = 1e-6) -> float:
+        """自定义IRR计算算法（牛顿法）（完全按照原脚本）"""
+        try:
+            # 检查现金流是否有效
+            if len(cash_flows) < 2:
+                return 0.0
+                
+            # 检查是否有正负现金流
+            has_positive = any(cf > 0 for cf in cash_flows)
+            has_negative = any(cf < 0 for cf in cash_flows)
+            
+            if not (has_positive and has_negative):
+                return 0.0
+            
+            # 初始猜测
+            rate = 0.1
+            
+            for iteration in range(max_iterations):
+                # 计算NPV和NPV导数
+                npv = sum(cf / (1 + rate) ** i for i, cf in enumerate(cash_flows))
+                npv_derivative = sum(-i * cf / (1 + rate) ** (i + 1) for i, cf in enumerate(cash_flows))
+                
+                if abs(npv) < precision:
+                    return rate
+                
+                if abs(npv_derivative) < precision:
+                    break
+                
+                # 牛顿法更新
+                new_rate = rate - npv / npv_derivative
+                
+                # 防止rate变为负数或过大
+                if new_rate < -0.99:
+                    new_rate = -0.99
+                elif new_rate > 10:
+                    new_rate = 10
+                
+                # 检查收敛
+                if abs(new_rate - rate) < precision:
+                    return new_rate
+                    
+                rate = new_rate
+            
+            return rate
+            
+        except Exception as e:
+            logger.warning(f"自定义IRR计算失败: {e}")
+            return 0.0
+
+    @staticmethod
+    def build_cash_flows_for_surrender(annual_premium: float, payment_period: int, policy_year: int, surrender_value: float) -> List[float]:
+        """构建一次性退保的现金流（完全按照原脚本）"""
+        cash_flows = []
+        
+        # 第0年到第(payment_period-1)年：负现金流（保费）
+        for year in range(payment_period):
+            cash_flows.append(-annual_premium)
+        
+        # 第payment_period年到第(policy_year-1)年：0现金流
+        for year in range(payment_period, policy_year):
+            cash_flows.append(0.0)
+        
+        # 第policy_year年：正现金流（退保价值）
+        cash_flows.append(surrender_value)
+        
+        return cash_flows
+
+    @staticmethod
+    def build_cash_flows_for_withdrawal(annual_premium: float, payment_period: int, policy_year: int, 
+                                       withdrawal_start_year: int, annual_withdrawal: float, 
+                                       final_surrender_value: float) -> List[float]:
+        """构建现金提取方案的现金流（完全按照原脚本）"""
+        cash_flows = []
+        
+        # 第0年到第(payment_period-1)年：负现金流（保费）
+        for year in range(payment_period):
+            cash_flows.append(-annual_premium)
+        
+        # 第payment_period年到第(withdrawal_start_year-1)年：0现金流
+        for year in range(payment_period, withdrawal_start_year):
+            cash_flows.append(0.0)
+        
+        # 第withdrawal_start_year年到第(policy_year-1)年：正现金流（年提取金额）
+        for year in range(withdrawal_start_year, policy_year):
+            cash_flows.append(annual_withdrawal)
+        
+        # 第policy_year年：正现金流（年提取金额 + 剩余退保价值）
+        cash_flows.append(annual_withdrawal + final_surrender_value)
+        
+        return cash_flows
+
 class FinalFilteredExtractor:
-    """最终过滤版数据提取器 - 完全按照原脚本逻辑"""
+    """最终过滤版数据提取器 - 适配Railway云环境"""
     
     def __init__(self, pdf_file_paths=None):
         # Railway版本：使用传入的文件路径，不进行自动检测
@@ -68,7 +184,7 @@ class FinalFilteredExtractor:
             "最高保单贷款",  # 第15页排除
             "悲观情景"       # 第26页排除
         ]
-    
+        
     def find_customer_info_page(self, pdf_path: str) -> int:
         """查找包含'保障摘要'的客户信息页面"""
         try:
@@ -394,1588 +510,216 @@ class FinalFilteredExtractor:
                                             withdrawal_amount = float(withdrawal_values[year_offset])
                                         
                                         # 验证数据合理性
-                                        if current_age > 0 and current_policy_year > 0 and total_amount > 0:
-                                            record = {
-                                                'age': current_age,
-                                                'policy_year': current_policy_year,
-                                                'surrender_value': total_amount,
-                                                'table_type': table_type,
-                                                'withdrawal_amount': withdrawal_amount
-                                            }
-                                            all_data.append(record)
-                                            logger.info(f"    添加记录: 年龄{current_age}, 第{current_policy_year}年, 金额{total_amount}")
-                                        else:
-                                            logger.warning(f"    数据无效: 年龄{current_age}, 年度{current_policy_year}, 金额{total_amount}")
-                                            
-                                    except ValueError as e:
-                                        logger.warning(f"第{row_idx + 1}行第{year_offset + 1}个数据解析错误: {e}")
-                                        continue
+                                        if current_policy_year > 100:  # 保单年度不应该超过100
+                                            logger.warning(f"异常保单年度 {current_policy_year}，跳过此记录")
+                                            continue
+                                        
+                                        record = {
+                                            'page': page_num,
+                                            'table_type': table_type,
+                                            'age': current_age,
+                                            'policy_year': current_policy_year,
+                                            'surrender_value': total_amount,
+                                            'withdrawal_amount': withdrawal_amount
+                                        }
+                                        
+                                        all_data.append(record)
+                                        logger.info(f"  添加记录: 年龄{current_age}, 第{current_policy_year}年, 退保${total_amount:,.0f}, 提取${withdrawal_amount:,.0f}")
+                                        
                                     except Exception as e:
-                                        logger.error(f"处理第{row_idx + 1}行第{year_offset + 1}个数据时出错: {e}")
-                                        continue
+                                        logger.warning(f"处理第{year_offset + 1}年数据时出错: {e}")
                         
         except Exception as e:
             logger.error(f"提取表格数据时出错: {e}")
         
-        logger.info(f"从{table_type}表格中提取了 {len(all_data)} 条记录")
         return all_data
 
-class RailwayCompletePipeline:
-    """Railway + Supabase 版本的完整流水线"""
+class RailwayInsurancePipeline:
+    """Railway适用的保险方案处理流水线"""
     
-    def __init__(self, 
-                 supabase_url: str,
-                 supabase_key: str,
-                 scheme1_file_url: str, 
-                 scheme2_file_url: str,
-                 task_id: str,
-                 work_dir: str = None):
-        """
-        初始化Railway版本的流水线
-        
-        Args:
-            supabase_url: Supabase项目URL
-            supabase_key: Supabase服务密钥
-            scheme1_file_url: 方案1 PDF文件的Supabase Storage URL
-            scheme2_file_url: 方案2 PDF文件的Supabase Storage URL  
-            task_id: 任务ID，用于生成唯一的文件路径
-            work_dir: 工作目录，默认使用临时目录
-        """
+    def __init__(self, pdf_urls=None, supabase_url=None, supabase_key=None, task_id=None):
+        # 初始化 Supabase 客户端
         self.supabase_url = supabase_url
         self.supabase_key = supabase_key
-        self.task_id = task_id
         
-        # 创建工作目录
-        if work_dir:
-            self.work_dir = work_dir
-            os.makedirs(work_dir, exist_ok=True)
-        else:
-            self.work_dir = tempfile.mkdtemp(prefix=f"railway_task_{task_id}_")
-        
-        # PDF文件URL
-        self.scheme1_file_url = scheme1_file_url
-        self.scheme2_file_url = scheme2_file_url
-        
-        # 本地临时文件路径
-        self.scheme1_path = os.path.join(self.work_dir, "scheme1.pdf")
-        self.scheme2_path = os.path.join(self.work_dir, "scheme2.pdf")
-        
-        # 输出文件路径（本地临时）
-        self.extracted_data_file = os.path.join(self.work_dir, "extracted_data.xlsx")
-        self.irr_results_file = os.path.join(self.work_dir, "irr_results.xlsx") 
-        self.final_html_file = os.path.join(self.work_dir, "report.html")
-        self.final_screenshot_file = os.path.join(self.work_dir, "screenshot.png")
-        
-        # HTML模板（Railway部署时需要包含在代码中）
-        self.html_template_content = self._get_html_template()
-        
-        # 初始化Supabase客户端
-        if SUPABASE_AVAILABLE:
+        if SUPABASE_AVAILABLE and supabase_url and supabase_key:
             self.supabase = create_client(supabase_url, supabase_key)
         else:
-            raise ImportError("Supabase客户端未安装，请安装: pip install supabase")
+            self.supabase = None
+            logger.warning("Supabase客户端未初始化，部分功能可能不可用")
+        
+        # 任务ID用于标识当前处理任务
+        self.task_id = task_id or str(uuid.uuid4())
+        print(f"任务ID: {self.task_id}")
+        
+        # 创建临时目录存储处理过程中的文件
+        self.temp_dir = tempfile.mkdtemp(prefix=f"railway_task_{self.task_id}_")
+        print(f"临时目录: {self.temp_dir}")
+        
+        # PDF文件URL
+        self.pdf_urls = pdf_urls or []
+        if len(self.pdf_urls) < 2:
+            raise ValueError("需要至少两个PDF文件URL")
+        
+        # 设置临时文件路径
+        self.scheme1_pdf_path = os.path.join(self.temp_dir, f"scheme1_{os.path.basename(self.pdf_urls[0])}")
+        self.scheme2_pdf_path = os.path.join(self.temp_dir, f"scheme2_{os.path.basename(self.pdf_urls[1])}")
+        
+        # 设置输出文件路径
+        self.extracted_data_file = os.path.join(self.temp_dir, "计划书数据提取结果.xlsx")
+        self.irr_results_file = os.path.join(self.temp_dir, "计划书数据提取结果_含IRR计算.xlsx")
+        self.final_html_file = os.path.join(self.temp_dir, "report.html")
+        self.final_screenshot_file = os.path.join(self.temp_dir, "screenshot.png")
+        
+        # HTML模板路径（先尝试从当前目录加载，如果不存在，使用内嵌模板）
+        self.html_template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "两套方案对比HTML模板_含占位符_修正7.html")
+        
+    def _cleanup(self):
+        """清理临时文件和目录"""
+        try:
+            shutil.rmtree(self.temp_dir)
+            print(f"临时目录已清理: {self.temp_dir}")
+        except Exception as e:
+            logger.error(f"清理临时目录时出错: {e}")
+    
+    async def _download_pdf(self, url: str, local_path: str) -> bool:
+        """从URL下载PDF文件到本地路径"""
+        try:
+            # 处理不同类型的URL：Supabase URL或普通HTTP URL
+            if self.supabase and url.startswith(self.supabase_url):
+                # 如果是Supabase URL，从存储中获取
+                # 解析存储路径
+                parsed_url = url.replace(f"{self.supabase_url}/storage/v1/object/", "")
+                parts = parsed_url.split("/")
+                if len(parts) < 2:
+                    raise ValueError(f"无效的Supabase存储URL: {url}")
+                
+                bucket_name = parts[0]
+                storage_path = "/".join(parts[1:])
+                
+                # 下载文件
+                try:
+                    res = self.supabase.storage.from_(bucket_name).download(storage_path)
+                    with open(local_path, 'wb') as f:
+                        f.write(res)
+                    print(f"从Supabase下载PDF成功: {url} -> {local_path}")
+                    return True
+                except Exception as e:
+                    logger.error(f"从Supabase下载PDF失败: {url}, 错误: {e}")
+                    raise
+            else:
+                # 普通HTTP URL
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(url, follow_redirects=True)
+                    response.raise_for_status()
+                    
+                    with open(local_path, 'wb') as f:
+                        f.write(response.content)
+                    
+                    print(f"下载PDF成功: {url} -> {local_path}")
+                    return True
+        
+        except Exception as e:
+            logger.error(f"下载PDF失败: {url}, 错误: {e}")
+            return False
     
     def _get_html_template(self) -> str:
-        """获取HTML模板内容 - Railway版本需要内嵌模板"""
-        # 读取HTML模板（开发时从文件读取，部署时将内容直接嵌入）
-        # 尝试多种可能的路径
-        possible_paths = [
-            # 直接在当前目录中
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "两套方案对比HTML模板_含占位符_修正7.html"),
-            # 在user_input_files目录中
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_input_files", "两套方案对比HTML模板_含占位符_修正7.html"),
-            # 在当前工作目录中
-            os.path.join(self.work_dir, "两套方案对比HTML模板_含占位符_修正7.html")
-        ]
-        
-        # 尝试每个路径，使用第一个可用的
-        template_path = None
-        for path in possible_paths:
-            if os.path.exists(path):
-                template_path = path
-                print(f"找到HTML模板文件: {path}")
-                break
-        
-        if template_path is None:
-            print("警告: 无法在任何路径下找到HTML模板文件，将使用内嵌模板")
-            template_path = ""  # 设置为空字符串以触发内嵌模板逻辑
-        
-        # 如果模板文件存在，读取它；否则使用内嵌的原始模板
-        if template_path and os.path.exists(template_path):
-            try:
-                with open(template_path, 'r', encoding='utf-8') as f:
-                    return f.read()
-            except Exception as e:
-                logger.error(f"读取HTML模板文件失败: {e}")
-                # 如果文件读取失败，使用内嵌的完整模板
-                return """
-
-  <!DOCTYPE html>
-  <html lang="en">
-  <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{DOCUMENT_TITLE}}</title>
-    <style id="reset">
-*,
-::before,
-::after {
-  box-sizing: border-box;
-  border-width: 0;
-}
-html,
-    body {
-      position: relative;
-      margin: 0;
-      padding: 0;
-      max-width: 2160px;
-      margin: 0 auto;
-      background-color: #f5f5f5;
-    }
-h1,
-h2,
-h3,
-h4,
-h5,
-h6 {
-  font-size: inherit;
-  font-weight: inherit;
-}
-
-a {
-  color: inherit;
-  text-decoration: inherit;
-}
-
-b,
-strong {
-  font-weight: bolder;
-}
-code,
-kbd,
-samp,
-pre {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-  font-size: 1em;
-}
-small {
-  font-size: 80%;
-}
-table {
-  text-indent: 0;
-  border-color: inherit;
-  border-collapse: collapse;
-}
-button,
-input,
-optgroup,
-select,
-textarea {
-  font-family: inherit;
-  font-size: 100%;
-  line-height: inherit;
-  color: inherit;
-  margin: 0;
-  padding: 0;
-}
-button,
-select {
-  text-transform: none;
-}
-button,
-[type='button'],
-[type='reset'],
-[type='submit'] {
-  -webkit-appearance: button;
-  background-color: transparent;
-  background-image: none;
-}
-progress {
-  vertical-align: baseline;
-}
-::-webkit-inner-spin-button,
-::-webkit-outer-spin-button {
-  height: auto;
-}
-blockquote,
-dl,
-dd,
-h1,
-h2,
-h3,
-h4,
-h5,
-h6,
-hr,
-figure,
-p,
-pre {
-  margin: 0;
-}
-
-fieldset {
-  margin: 0;
-  padding: 0;
-}
-
-legend {
-  padding: 0;
-}
-
-ol,
-ul,
-menu {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-
-textarea {
-  resize: vertical;
-}
-
-input::placeholder,
-textarea::placeholder {
-  opacity: 1;
-  color: #9ca3af;
-}
-
-img,
-svg,
-video,
-canvas,
-audio,
-iframe,
-embed,
-object {
-  display: block;
-  vertical-align: middle;
-}
-
-img,
-video {
-  max-width: 100%;
-  height: auto;
-}
-</style>
-  <style>
-    html,
-    body {
-      position: relative;
-      margin: 0;
-      padding: 0;
-      max-width: 2160px;
-      margin: 0 auto;
-      background-color: #f5f5f5;
-    }
-    .bg-clip-text {
-      -webkit-background-clip: text !important;
-      background-clip: text !important;
-    }
-    #container {
-      position: relative;
-      left: 50%;
-      top: 20px;
-      width: 384px;
-      height: 1601px;
-      transform-origin: 0 0;
-      transform: translateX(-50%) scale(1);
-      display: block;
-      overflow: hidden;
-      max-width: 2160px;
-    }
-  </style>
-  </head>
-  <body>
-    <div id="container">
-    <div
-        style="width: 384px; height: 1601px; position: absolute; background: rgb(255, 255, 255); border-radius: 20px; overflow: hidden; filter: drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0.1) 0px 20px 40px);">
-        <div
-            style="width: 384px; height: 79px; position: absolute; left: 0px; top: 0px; background: linear-gradient(rgb(178, 34, 34) 100%, rgb(220, 20, 60) 0%);">
-            <div
-                style="position: absolute; left: 72px; top: 20px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                <p><span
-                        style="font-size: 30px; text-decoration: none; line-height: 45px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">{{HEADER_PLAN_TITLE}}</span>
-                </p>
-            </div>
-        </div>
-        <div style="width: 384px; height: 244px; position: absolute; left: 0px; top: 79px; background: rgb(248, 249, 255);">
-            <div style="width: 360px; height: 120px; position: absolute; left: 12px; top: 12px;">
-                <div
-                    style="width: 174.5px; height: 56px; position: absolute; left: 0px; top: 0px; background: rgb(255, 255, 255); border-radius: 8px; filter: drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0.05) 0px 2px 8px);">
-                    <div style="width: 158.5px; height: 40px; position: absolute; left: 8px; top: 8px;">
-                        <div
-                            style="position: absolute; left: 55.25px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(102, 102, 102); text-transform: none;">{{CUSTOMER_INFO_LABEL_NAME}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 51.75px; top: 20px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{CUSTOMER_INFO_NAME}}</span>
-                            </p>
-                        </div>
-                    </div>
-                </div>
-                <div
-                    style="width: 174.5px; height: 56px; position: absolute; left: 185.5px; top: 0px; background: rgb(255, 255, 255); border-radius: 8px; filter: drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0.05) 0px 2px 8px);">
-                    <div style="width: 158.5px; height: 40px; position: absolute; left: 8px; top: 8px;">
-                        <div
-                            style="position: absolute; left: 55.25px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(102, 102, 102); text-transform: none;">{{CUSTOMER_INFO_LABEL_AGE}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 60px; top: 20px; width: 40px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{CUSTOMER_INFO_AGE}}</span>
-                            </p>
-                        </div>
-                    </div>
-                </div>
-                <div
-                    style="width: 174.5px; height: 56px; position: absolute; left: 0px; top: 64px; background: rgb(255, 255, 255); border-radius: 8px; filter: drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0.05) 0px 2px 8px);">
-                    <div style="width: 158.5px; height: 40px; position: absolute; left: 8px; top: 8px;">
-                        <div
-                            style="position: absolute; left: 55.25px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(102, 102, 102); text-transform: none;">{{CUSTOMER_INFO_LABEL_CURRENCY}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 65.25px; top: 20px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{CUSTOMER_INFO_CURRENCY}}</span>
-                            </p>
-                        </div>
-                    </div>
-                </div>
-                <div
-                    style="width: 174.5px; height: 56px; position: absolute; left: 185.5px; top: 64px; background: rgb(255, 255, 255); border-radius: 8px; filter: drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0.05) 0px 2px 8px);">
-                    <div style="width: 158.5px; height: 40px; position: absolute; left: 8px; top: 8px;">
-                        <div
-                            style="position: absolute; left: 55.25px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(102, 102, 102); text-transform: none;">{{CUSTOMER_INFO_LABEL_COVERAGE_PERIOD}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 65.25px; top: 20px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{CUSTOMER_INFO_COVERAGE_PERIOD}}</span>
-                            </p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            <div
-                style="width: 360px; height: 88px; position: absolute; left: 12px; top: 144px; background: linear-gradient(rgb(250, 177, 160) 100%, rgb(255, 234, 167) 0%); border-radius: 12px;">
-                <div style="width: 328px; height: 56px; position: absolute; left: 16px; top: 16px;">
-                    <div style="width: 113.664px; height: 56px; position: absolute; left: -14.5px; top: 0px;">
-                        <div
-                            style="position: absolute; left: 29px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 500; font-family: inter; white-space: break-spaces; color: rgb(45, 52, 54); text-transform: none;">{{PREMIUM_INFO_LABEL_ANNUAL}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 12px; top: 28px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 18px; text-decoration: none; line-height: 28px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(45, 52, 54); text-transform: none;">{{PREMIUM_INFO_ANNUAL_AMOUNT}}</span>
-                            </p>
-                        </div>
-                    </div>
-                    <div style="width: 98.6641px; height: 56px; position: absolute; left: 115.164px; top: 0px;">
-                        <div
-                            style="position: absolute; left: 28.3359px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 500; font-family: inter; white-space: break-spaces; color: rgb(45, 52, 54); text-transform: none;">{{PREMIUM_INFO_LABEL_PAYMENT_PERIOD}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 34.3359px; top: 28px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 18px; text-decoration: none; line-height: 28px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(45, 52, 54); text-transform: none;">{{PREMIUM_INFO_PAYMENT_PERIOD}}</span>
-                            </p>
-                        </div>
-                    </div>
-                    <div style="width: 112.664px; height: 56px; position: absolute; left: 229.828px; top: 0px;">
-                        <div
-                            style="position: absolute; left: 35.6719px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 500; font-family: inter; white-space: break-spaces; color: rgb(45, 52, 54); text-transform: none;">{{PREMIUM_INFO_LABEL_TOTAL}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 4.67188px; top: 28px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 18px; text-decoration: none; line-height: 28px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(45, 52, 54); text-transform: none;">{{PREMIUM_INFO_TOTAL_AMOUNT}}</span>
-                            </p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        <div
-            style="width: 384px; height: 351px; position: absolute; left: 0px; top: 323px; border-style: solid; border-color: rgb(240, 240, 240); border-width: 1px;">
-            <div style="width: 360px; height: 28px; position: absolute; left: 12px; top: 12px;">
-                <div
-                    style="width: 4px; height: 20px; position: absolute; left: 0px; top: 4px; background: linear-gradient(rgb(178, 34, 34) 100%); border-radius: 4px;">
-                </div>
-                <div
-                    style="position: absolute; left: 16px; top: 0px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                    <p><span
-                            style="font-size: 18px; text-decoration: none; line-height: 28px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{PLAN1_MAIN_TITLE}}</span>
-                    </p>
-                </div>
-            </div>
-            <div
-                style="width: 360px; height: 286px; position: absolute; left: 12px; top: 52px; background: rgb(255, 255, 255); border-radius: 12px; overflow: hidden; filter: drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0.05) 0px 2px 8px);">
-                <div style="width: 360px; height: 286px; position: absolute; left: 0px; top: 0px;">
-                    <div style="width: 367px; height: 40px; position: absolute; left: 0px; top: 0px;">
-                        <div
-                            style="position: absolute; left: 12px; top: 8px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{PLAN1_YEAR_1}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 144px; top: 8px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(102, 102, 102); text-transform: none;">{{PLAN1_AMOUNT_1}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 290px; top: 8px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(39, 174, 96); text-transform: none;">{{PLAN1_RATE_1}}</span>
-                            </p>
-                        </div>
-                    </div>
-                    <div
-                        style="width: 373px; height: 41px; position: absolute; left: 0px; top: 81px; border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                        <div
-                            style="position: absolute; left: 12px; top: 9px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{PLAN1_YEAR_3}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 144px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(102, 102, 102); text-transform: none;">{{PLAN1_AMOUNT_3}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 290px; top: 9px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(39, 174, 96); text-transform: none;">{{PLAN1_RATE_3}}</span>
-                            </p>
-                        </div>
-                    </div>
-                    <div
-                        style="width: 370px; height: 41px; position: absolute; left: 0px; top: 163px; border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                        <div
-                            style="position: absolute; left: 12px; top: 9px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{PLAN1_YEAR_5}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 144px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(102, 102, 102); text-transform: none;">{{PLAN1_AMOUNT_5}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 290px; top: 9px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(39, 174, 96); text-transform: none;">{{PLAN1_RATE_5}}</span>
-                            </p>
-                        </div>
-                    </div>
-                    <div
-                        style="width: 373px; height: 41px; position: absolute; left: 0px; top: 245px; border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                        <div
-                            style="position: absolute; left: 12px; top: 9px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{PLAN1_YEAR_7}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 144px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(102, 102, 102); text-transform: none;">{{PLAN1_AMOUNT_7}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 290px; top: 9px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(39, 174, 96); text-transform: none;">{{PLAN1_RATE_7}}</span>
-                            </p>
-                        </div>
-                    </div>
-                    <div
-                        style="width: 369px; height: 41px; position: absolute; left: 0px; top: 122px; background: rgb(250, 250, 250); border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                        <div
-                            style="position: absolute; left: 12px; top: 9px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{PLAN1_YEAR_4}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 144px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(102, 102, 102); text-transform: none;">{{PLAN1_AMOUNT_4}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 290px; top: 9px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(39, 174, 96); text-transform: none;">{{PLAN1_RATE_4}}</span>
-                            </p>
-                        </div>
-                    </div>
-                    <div
-                        style="width: 373px; height: 41px; position: absolute; left: 0px; top: 204px; background: rgb(250, 250, 250); border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                        <div
-                            style="position: absolute; left: 12px; top: 9px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{PLAN1_YEAR_6}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 144px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(102, 102, 102); text-transform: none;">{{PLAN1_AMOUNT_6}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 290px; top: 9px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(39, 174, 96); text-transform: none;">{{PLAN1_RATE_6}}</span>
-                            </p>
-                        </div>
-                    </div>
-                    <div
-                        style="width: 368px; height: 41px; position: absolute; left: 0px; top: 40px; background: rgb(250, 250, 250); border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                        <div
-                            style="position: absolute; left: 12px; top: 9px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{PLAN1_YEAR_2}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 144px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(102, 102, 102); text-transform: none;">{{PLAN1_AMOUNT_2}}</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 290px; top: 9px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(39, 174, 96); text-transform: none;">{{PLAN1_RATE_2}}</span>
-                            </p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        <div
-            style="width: 386px; height: 81px; position: absolute; left: -0.436096px; top: 1533.94px; background: rgb(248, 249, 255);">
-            <div
-                style="position: absolute; left: 92px; top: 19px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                <p><span
-                        style="font-size: 12px; text-decoration: none; line-height: 19.5px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(102, 102, 102); text-transform: none;">* 以上数据如有错漏，请以计划书为准</span>
-                </p>
-            </div>
-            <div
-                style="position: absolute; left: 26px; top: 42px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                <p><span
-                        style="font-size: 12px; text-decoration: none; line-height: 19.5px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(102, 102, 102); text-transform: none;">* 整体收益计算包含非保证金额，有可能根据实际投资表现调整</span>
-                </p>
-            </div>
-        </div>
-        <div
-            style="width: 386px; height: 585px; position: absolute; left: 0px; top: 949px; border-style: solid; border-color: rgb(240, 240, 240); border-width: 1px;">
-            <div style="width: 362px; height: 28px; position: absolute; left: 12px; top: 12px;">
-                <div
-                    style="width: 4px; height: 20px; position: absolute; left: 0px; top: 4px; background: linear-gradient(rgb(178, 34, 34) 100%); border-radius: 4px;">
-                </div>
-                <div
-                    style="position: absolute; left: 16px; top: 0px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                    <p><span
-                            style="font-size: 18px; text-decoration: none; line-height: 28px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{PLAN_COMPARISON_TITLE}}</span>
-                    </p>
-                </div>
-            </div>
-            <div style="width: 362px; height: 530px; position: absolute; left: 12px; top: 52px;">
-                <div
-                    style="width: 174px; height: 535px; position: absolute; left: 1px; top: 0px; background: rgb(255, 255, 255); border-radius: 12px; overflow: hidden; filter: drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0.05) 0px 2px 8px);">
-                    <div
-                        style="width: 178px; height: 56px; position: absolute; left: -2.4361px; top: -0.0600585px; background: linear-gradient(rgb(127, 29, 29) 100%, rgb(185, 28, 28) 0%);">
-                        <div
-                            style="position: absolute; left: 15px; top: 8px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">方案2
-                                </span></p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 20px; top: 28px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">{{FIXED_ANNUITY_PLAN2_SUBTITLE}}</span>
-                            </p>
-                        </div>
-                    </div>
-                    <div style="width: 174px; height: 484px; position: absolute; left: 0px; top: 50px;">
-                        <div
-                            style="width: 175px; height: 97px; position: absolute; left: 0px; top: 96px; border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                            <div
-                                style="position: absolute; left: 67.5px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                <p><span
-                                        style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_YEAR_2}}</span>
-                                </p>
-                            </div>
-                            <div style="width: 158px; height: 32px; position: absolute; left: 8.5px; top: 29px;">
-                                <div style="width: 121px; height: 16px; position: absolute; left: 10px; top: 16px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_REMAINING_VALUE}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_REMAINING_VALUE_2}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                                <div style="width: 119px; height: 16px; position: absolute; left: 10px; top: 0px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_CUMULATIVE_WITHDRAWAL}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_CUMULATIVE_WITHDRAWAL_2}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-                            <div
-                                style="width: 159px; height: 24px; position: absolute; left: 8px; top: 65px; background: linear-gradient(rgb(253, 203, 110) 100%, rgb(253, 121, 168) 0%); border-radius: 4px;">
-                                <div
-                                    style="position: absolute; left: 59px; top: 2px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">{{PLAN2_RATE_2}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 177px; height: 97px; position: absolute; left: 0px; top: 290px; border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                            <div
-                                style="position: absolute; left: 69px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                <p><span
-                                        style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_YEAR_4}}</span>
-                                </p>
-                            </div>
-                            <div style="width: 158px; height: 32px; position: absolute; left: 9.5px; top: 29px;">
-                                <div style="width: 125px; height: 16px; position: absolute; left: 10px; top: 16px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_REMAINING_VALUE}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_REMAINING_VALUE_4}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                                <div style="width: 121px; height: 16px; position: absolute; left: 10px; top: 0px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_CUMULATIVE_WITHDRAWAL}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_CUMULATIVE_WITHDRAWAL_4}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-                            <div
-                                style="width: 161px; height: 24px; position: absolute; left: 8px; top: 65px; background: linear-gradient(rgb(253, 203, 110) 100%, rgb(253, 121, 168) 0%); border-radius: 4px;">
-                                <div
-                                    style="position: absolute; left: 59px; top: 2px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">{{PLAN2_RATE_4}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 177px; height: 97px; position: absolute; left: 0px; top: 193px; background: rgb(250, 250, 250); border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                            <div
-                                style="position: absolute; left: 68.5px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                <p><span
-                                        style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_YEAR_3}}</span>
-                                </p>
-                            </div>
-                            <div style="width: 158px; height: 32px; position: absolute; left: 9.5px; top: 29px;">
-                                <div style="width: 124px; height: 16px; position: absolute; left: 10px; top: 16px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_REMAINING_VALUE}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_REMAINING_VALUE_3}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                                <div style="width: 124px; height: 16px; position: absolute; left: 10px; top: 0px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_CUMULATIVE_WITHDRAWAL}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_CUMULATIVE_WITHDRAWAL_3}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-                            <div
-                                style="width: 161px; height: 24px; position: absolute; left: 8px; top: 65px; background: linear-gradient(rgb(253, 203, 110) 100%, rgb(253, 121, 168) 0%); border-radius: 4px;">
-                                <div
-                                    style="position: absolute; left: 59px; top: 2px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">{{PLAN2_RATE_3}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 176px; height: 96px; position: absolute; left: 0px; top: 0px; background: rgb(250, 250, 250);">
-                            <div
-                                style="position: absolute; left: 68px; top: 8px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                <p><span
-                                        style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_YEAR_1}}</span>
-                                </p>
-                            </div>
-                            <div style="width: 158px; height: 32px; position: absolute; left: 9px; top: 28px;">
-                                <div style="width: 117px; height: 16px; position: absolute; left: 10px; top: 16px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_REMAINING_VALUE}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_REMAINING_VALUE_1}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                                <div style="width: 110px; height: 16px; position: absolute; left: 10px; top: 0px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_CUMULATIVE_WITHDRAWAL}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_CUMULATIVE_WITHDRAWAL_1}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-                            <div
-                                style="width: 160px; height: 24px; position: absolute; left: 8px; top: 64px; background: linear-gradient(rgb(253, 203, 110) 100%, rgb(253, 121, 168) 0%); border-radius: 4px;">
-                                <div
-                                    style="position: absolute; left: 59px; top: 2px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">{{PLAN2_RATE_1}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 177px; height: 97px; position: absolute; left: 0px; top: 387px; background: rgb(250, 250, 250); border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                            <div
-                                style="position: absolute; left: 65.5px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                <p><span
-                                        style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_YEAR_5}}</span>
-                                </p>
-                            </div>
-                            <div style="width: 158px; height: 32px; position: absolute; left: 9.5px; top: 29px;">
-                                <div
-                                    style="width: 140px; height: 16px; position: absolute; left: 10.0639px; top: 15.9399px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_REMAINING_VALUE}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_REMAINING_VALUE_5}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                                <div style="width: 124px; height: 16px; position: absolute; left: 10px; top: 0px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_CUMULATIVE_WITHDRAWAL}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN2_CUMULATIVE_WITHDRAWAL_5}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-                            <div
-                                style="width: 161px; height: 24px; position: absolute; left: 8px; top: 65px; background: linear-gradient(rgb(253, 203, 110) 100%, rgb(253, 121, 168) 0%); border-radius: 4px;">
-                                <div
-                                    style="position: absolute; left: 59px; top: 2px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">{{PLAN2_RATE_5}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                <div
-                    style="width: 174px; height: 535px; position: absolute; left: 187px; top: 0px; background: rgb(255, 255, 255); border-radius: 12px; overflow: hidden; filter: drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0) 0px 0px 0px) drop-shadow(rgba(0, 0, 0, 0.05) 0px 2px 8px);">
-                    <div
-                        style="width: 178px; height: 56px; position: absolute; left: -0.436096px; top: -0.0600585px; background: linear-gradient(rgb(153, 27, 27) 100%, rgb(220, 38, 38) 0%);">
-                        <div
-                            style="position: absolute; left: 15px; top: 8px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">方案3
-                                </span></p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 20px; top: 28px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">{{FIXED_ANNUITY_PLAN3_SUBTITLE}}</span>
-                            </p>
-                        </div>
-                    </div>
-                    <div style="width: 174px; height: 484px; position: absolute; left: -1.13687e-13px; top: 50px;">
-                        <div
-                            style="width: 177px; height: 96px; position: absolute; left: 0px; top: 0px; background: rgb(250, 250, 250);">
-                            <div
-                                style="position: absolute; left: 68.5px; top: 8px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                <p><span
-                                        style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_YEAR_1}}</span>
-                                </p>
-                            </div>
-                            <div style="width: 158px; height: 32px; position: absolute; left: 9.5px; top: 28px;">
-                                <div style="width: 122px; height: 16px; position: absolute; left: 10px; top: 16px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_REMAINING_VALUE}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_REMAINING_VALUE_1}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                                <div style="width: 114px; height: 16px; position: absolute; left: 10px; top: 0px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_CUMULATIVE_WITHDRAWAL}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_CUMULATIVE_WITHDRAWAL_1}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-                            <div
-                                style="width: 161px; height: 24px; position: absolute; left: 8px; top: 64px; background: linear-gradient(rgb(253, 203, 110) 100%, rgb(253, 121, 168) 0%); border-radius: 4px;">
-                                <div
-                                    style="position: absolute; left: 59px; top: 2px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">{{PLAN3_RATE_1}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 174px; height: 97px; position: absolute; left: 0px; top: 96px; border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                            <div
-                                style="position: absolute; left: 67px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                <p><span
-                                        style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_YEAR_2}}</span>
-                                </p>
-                            </div>
-                            <div style="width: 158px; height: 32px; position: absolute; left: 8px; top: 29px;">
-                                <div style="width: 122px; height: 16px; position: absolute; left: 10px; top: 16px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_REMAINING_VALUE}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_REMAINING_VALUE_2}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                                <div style="width: 122px; height: 16px; position: absolute; left: 10px; top: 0px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_CUMULATIVE_WITHDRAWAL}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_CUMULATIVE_WITHDRAWAL_2}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-                            <div
-                                style="width: 158px; height: 24px; position: absolute; left: 8px; top: 65px; background: linear-gradient(rgb(253, 203, 110) 100%, rgb(253, 121, 168) 0%); border-radius: 4px;">
-                                <div
-                                    style="position: absolute; left: 59px; top: 2px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">{{PLAN3_RATE_2}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 177px; height: 97px; position: absolute; left: 0px; top: 193px; background: rgb(250, 250, 250); border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                            <div
-                                style="position: absolute; left: 68.5px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                <p><span
-                                        style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_YEAR_3}}</span>
-                                </p>
-                            </div>
-                            <div style="width: 158px; height: 32px; position: absolute; left: 9.5px; top: 29px;">
-                                <div style="width: 124px; height: 16px; position: absolute; left: 10px; top: 16px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_REMAINING_VALUE}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_REMAINING_VALUE_3}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                                <div style="width: 124px; height: 16px; position: absolute; left: 10px; top: 0px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_CUMULATIVE_WITHDRAWAL}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_CUMULATIVE_WITHDRAWAL_3}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-                            <div
-                                style="width: 161px; height: 24px; position: absolute; left: 8px; top: 65px; background: linear-gradient(rgb(253, 203, 110) 100%, rgb(253, 121, 168) 0%); border-radius: 4px;">
-                                <div
-                                    style="position: absolute; left: 59px; top: 2px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">{{PLAN3_RATE_3}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 177px; height: 97px; position: absolute; left: 0px; top: 290px; border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                            <div
-                                style="position: absolute; left: 69px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                <p><span
-                                        style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_YEAR_4}}</span>
-                                </p>
-                            </div>
-                            <div style="width: 158px; height: 32px; position: absolute; left: 9.5px; top: 29px;">
-                                <div style="width: 123px; height: 16px; position: absolute; left: 10px; top: 16px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_REMAINING_VALUE}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_REMAINING_VALUE_4}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                                <div style="width: 124px; height: 16px; position: absolute; left: 10px; top: 0px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_CUMULATIVE_WITHDRAWAL}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_CUMULATIVE_WITHDRAWAL_4}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-                            <div
-                                style="width: 161px; height: 24px; position: absolute; left: 8px; top: 65px; background: linear-gradient(rgb(253, 203, 110) 100%, rgb(253, 121, 168) 0%); border-radius: 4px;">
-                                <div
-                                    style="position: absolute; left: 59px; top: 2px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">{{PLAN3_RATE_4}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 177px; height: 97px; position: absolute; left: 0px; top: 387px; background: rgb(250, 250, 250); border-style: solid; border-color: rgb(245, 245, 245); border-width: 1px;">
-                            <div
-                                style="position: absolute; left: 65.5px; top: 9px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                <p><span
-                                        style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_YEAR_5}}</span>
-                                </p>
-                            </div>
-                            <div style="width: 158px; height: 32px; position: absolute; left: 9.5px; top: 29px;">
-                                <div style="width: 124px; height: 16px; position: absolute; left: 10px; top: 16px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_REMAINING_VALUE}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_REMAINING_VALUE_5}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                                <div style="width: 124px; height: 16px; position: absolute; left: 10px; top: 0px;">
-                                    <div
-                                        style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{LABEL_CUMULATIVE_WITHDRAWAL}}</span>
-                                        </p>
-                                    </div>
-                                    <div
-                                        style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                        <p><span
-                                                style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(0, 0, 0); text-transform: none;">{{PLAN3_CUMULATIVE_WITHDRAWAL_5}}</span>
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-                            <div
-                                style="width: 161px; height: 24px; position: absolute; left: 8px; top: 65px; background: linear-gradient(rgb(253, 203, 110) 100%, rgb(253, 121, 168) 0%); border-radius: 4px;">
-                                <div
-                                    style="position: absolute; left: 59px; top: 2px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 14px; text-decoration: none; line-height: 20px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(255, 255, 255); text-transform: none;">{{PLAN3_RATE_5}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        <div
-            style="width: 386px; height: 275px; position: absolute; left: 0px; top: 674px; border-style: solid; border-color: rgb(240, 240, 240); border-width: 1px;">
-            <div style="width: 362px; height: 28px; position: absolute; left: 12px; top: 12px;">
-                <div
-                    style="width: 4px; height: 20px; position: absolute; left: 0px; top: 4px; background: linear-gradient(rgb(178, 34, 34) 100%); border-radius: 4px;">
-                </div>
-                <div
-                    style="position: absolute; left: 16px; top: 0px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                    <p><span
-                            style="font-size: 18px; text-decoration: none; line-height: 28px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(51, 51, 51); text-transform: none;">{{PLAN_FIXED_ANNUITY_TITLE}}</span>
-                    </p>
-                </div>
-            </div>
-            <div style="width: 362px; height: 210px; position: absolute; left: 12px; top: 52px;">
-                <div
-                    style="width: 175px; height: 210px; position: absolute; left: 0px; top: 0px; background: linear-gradient(rgb(255, 240, 241) 100%, rgb(255, 228, 230) 0%); border-radius: 12px; border-style: solid; border-color: rgb(248, 194, 198); border-width: 1px;">
-                    <div style="width: 149px; height: 44px; position: absolute; left: 13px; top: 13px;">
-                        <div
-                            style="position: absolute; left: 53.5px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(185, 28, 28); text-transform: none;">方案2</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 13px; top: 28px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(127, 29, 29); text-transform: none;">{{FIXED_ANNUITY_PLAN2_SUBTITLE}}</span>
-                            </p>
-                        </div>
-                    </div>
-                    <div style="width: 149px; height: 132px; position: absolute; left: 13px; top: 65px;">
-                        <div
-                            style="width: 149px; height: 30px; position: absolute; left: 0px; top: 0px; background: rgba(255, 255, 255, 0.8); border-radius: 4px; border-style: solid; border-color: rgb(254, 226, 226); border-width: 1px;">
-                            <div style="width: 140px; height: 16px; position: absolute; left: 13px; top: 0px;">
-                                <div
-                                    style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(127, 29, 29); text-transform: none;">开始提取时间:</span>
-                                    </p>
-                                </div>
-                                <div
-                                    style="position: absolute; left: 82px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(127, 29, 29); text-transform: none;">{{FIXED_ANNUITY_PLAN2_START_TIME}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 149px; height: 30px; position: absolute; left: 0px; top: 34px; background: rgba(255, 255, 255, 0.8); border-radius: 4px; border-style: solid; border-color: rgb(254, 226, 226); border-width: 1px;">
-                            <div style="width: 98px; height: 16px; position: absolute; left: 13px; top: 0px;">
-                                <div
-                                    style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(127, 29, 29); text-transform: none;">提取持续时间:</span>
-                                    </p>
-                                </div>
-                                <div
-                                    style="position: absolute; left: 82px; top: -0.0600585px; width: 40px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(127, 29, 29); text-transform: none;">{{FIXED_ANNUITY_PLAN2_DURATION}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 149px; height: 30px; position: absolute; left: 0px; top: 68px; background: rgba(255, 255, 255, 0.8); border-radius: 4px; border-style: solid; border-color: rgb(254, 226, 226); border-width: 1px;">
-                            <div style="width: 123px; height: 16px; position: absolute; left: 6px; top: 0px;">
-                                <div
-                                    style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(127, 29, 29); text-transform: none;">{{LABEL_CUMULATIVE_WITHDRAWAL}}</span>
-                                    </p>
-                                </div>
-                                <div
-                                    style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(127, 29, 29); text-transform: none;">{{FIXED_ANNUITY_PLAN2_CUMULATIVE_WITHDRAWAL}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 149px; height: 30px; position: absolute; left: 0px; top: 102px; background: rgba(255, 255, 255, 0.8); border-radius: 4px; border-style: solid; border-color: rgb(254, 226, 226); border-width: 1px;">
-                            <div style="width: 123px; height: 16px; position: absolute; left: 6px; top: 0px;">
-                                <div
-                                    style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(127, 29, 29); text-transform: none;">{{LABEL_REMAINING_VALUE}}</span>
-                                    </p>
-                                </div>
-                                <div
-                                    style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(127, 29, 29); text-transform: none;">{{FIXED_ANNUITY_PLAN2_REMAINING_VALUE}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                <div
-                    style="width: 175px; height: 210px; position: absolute; left: 187px; top: 0px; background: linear-gradient(rgb(255, 234, 234) 100%, rgb(254, 243, 242) 0%); border-radius: 12px; border-style: solid; border-color: rgb(254, 202, 202); border-width: 1px;">
-                    <div style="width: 149px; height: 44px; position: absolute; left: 13px; top: 13px;">
-                        <div
-                            style="position: absolute; left: 53.5px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 16px; text-decoration: none; line-height: 24px; font-weight: 700; font-family: inter; white-space: break-spaces; color: rgb(220, 38, 38); text-transform: none;">方案3</span>
-                            </p>
-                        </div>
-                        <div
-                            style="position: absolute; left: 13px; top: 28px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                            <p><span
-                                    style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(153, 27, 27); text-transform: none;">{{FIXED_ANNUITY_PLAN3_SUBTITLE}}</span>
-                            </p>
-                        </div>
-                    </div>
-                    <div style="width: 149px; height: 132px; position: absolute; left: 13px; top: 65px;">
-                        <div
-                            style="width: 149px; height: 30px; position: absolute; left: 0px; top: 0px; background: rgba(255, 255, 255, 0.8); border-radius: 4px; border-style: solid; border-color: rgb(254, 215, 215); border-width: 1px;">
-                            <div style="width: 140px; height: 16px; position: absolute; left: 13px; top: 0px;">
-                                <div
-                                    style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(153, 27, 27); text-transform: none;">开始提取时间:</span>
-                                    </p>
-                                </div>
-                                <div
-                                    style="position: absolute; left: 82px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(153, 27, 27); text-transform: none;">{{FIXED_ANNUITY_PLAN3_START_TIME}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 149px; height: 30px; position: absolute; left: 0px; top: 34px; background: rgba(255, 255, 255, 0.8); border-radius: 4px; border-style: solid; border-color: rgb(254, 215, 215); border-width: 1px;">
-                            <div style="width: 98px; height: 16px; position: absolute; left: 13px; top: 0px;">
-                                <div
-                                    style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(153, 27, 27); text-transform: none;">提取持续时间:</span>
-                                    </p>
-                                </div>
-                                <div
-                                    style="position: absolute; left: 82px; top: 0px; width: 40px; text-align: left; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(153, 27, 27); text-transform: none;">{{FIXED_ANNUITY_PLAN3_DURATION}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 149px; height: 30px; position: absolute; left: 0px; top: 68px; background: rgba(255, 255, 255, 0.8); border-radius: 4px; border-style: solid; border-color: rgb(254, 215, 215); border-width: 1px;">
-                            <div style="width: 122px; height: 16px; position: absolute; left: 6px; top: 0px;">
-                                <div
-                                    style="position: absolute; left: 0px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(153, 27, 27); text-transform: none;">{{LABEL_CUMULATIVE_WITHDRAWAL}}</span>
-                                    </p>
-                                </div>
-                                <div
-                                    style="position: absolute; left: 58px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(153, 27, 27); text-transform: none;">{{FIXED_ANNUITY_PLAN3_CUMULATIVE_WITHDRAWAL}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                        <div
-                            style="width: 149px; height: 30px; position: absolute; left: 0px; top: 102px; background: rgba(255, 255, 255, 0.8); border-radius: 4px; border-style: solid; border-color: rgb(254, 215, 215); border-width: 1px;">
-                            <div style="width: 126px; height: 16px; position: absolute; left: 5.5639px; top: 0px;">
-                                <div
-                                    style="position: absolute; left: -0.5px; top: 0px; width: 56px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(153, 27, 27); text-transform: none;">{{LABEL_REMAINING_VALUE}}</span>
-                                    </p>
-                                </div>
-                                <div
-                                    style="position: absolute; left: 61.5px; top: 0px; text-align: center; vertical-align: top; display: flex; flex-direction: column; justify-content: flex-start;">
-                                    <p><span
-                                            style="font-size: 12px; text-decoration: none; line-height: 16px; font-weight: 400; font-family: inter; white-space: break-spaces; color: rgb(127, 29, 29); text-transform: none;">{{FIXED_ANNUITY_PLAN3_REMAINING_VALUE}}</span>
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-    </div>
-  
-  <script>
-    // Template data replacement function
-    function populateTemplate(data) {
-      const container = document.getElementById('container');
-      let html = container.innerHTML;
-      
-      // Replace all placeholders with actual data
-      for (const [key, value] of Object.entries(data)) {
-        const placeholder = `{{${key}}}`;
-        html = html.replace(new RegExp(placeholder.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'), 'g'), value);
-      }
-      
-      container.innerHTML = html;
-      
-      // Also update document title
-      if (data.DOCUMENT_TITLE) {
-        document.title = data.DOCUMENT_TITLE;
-      }
-    }
-
-    // Example data structure with all placeholders
-    const exampleData = {
-      DOCUMENT_TITLE: "高息美元储蓄计划对比",
-      HEADER_PLAN_TITLE: "高息美元储蓄计划",
-      CUSTOMER_INFO_LABEL_NAME: "客户姓名",
-      CUSTOMER_INFO_NAME: "VIP 先生",
-      CUSTOMER_INFO_LABEL_AGE: "投保年龄",
-      CUSTOMER_INFO_AGE: "0岁",
-      CUSTOMER_INFO_LABEL_CURRENCY: "保单货币",
-      CUSTOMER_INFO_CURRENCY: "美元",
-      CUSTOMER_INFO_LABEL_COVERAGE_PERIOD: "保障期间",
-      CUSTOMER_INFO_COVERAGE_PERIOD: "终身",
-      PREMIUM_INFO_LABEL_ANNUAL: "年缴保费",
-      PREMIUM_INFO_ANNUAL_AMOUNT: "$200,000",
-      PREMIUM_INFO_LABEL_PAYMENT_PERIOD: "缴费期",
-      PREMIUM_INFO_PAYMENT_PERIOD: "5年",
-      PREMIUM_INFO_LABEL_TOTAL: "总保费",
-      PREMIUM_INFO_TOTAL_AMOUNT: "$1,000,000",
-      PLAN1_MAIN_TITLE: "方案1：一次性提取",
-      PLAN1_YEAR_1: "第10年",
-      PLAN1_AMOUNT_1: "$1,323,611",
-      PLAN1_RATE_1: "4.06%",
-      PLAN1_YEAR_2: "第15年",
-      PLAN1_AMOUNT_2: "$1,872,332",
-      PLAN1_RATE_2: "5.34%",
-      PLAN1_YEAR_3: "第20年",
-      PLAN1_AMOUNT_3: "$2,723,872",
-      PLAN1_RATE_3: "6.05%",
-      PLAN1_YEAR_4: "第25年",
-      PLAN1_AMOUNT_4: "$4,137,653",
-      PLAN1_RATE_4: "6.65%",
-      PLAN1_YEAR_5: "第30年",
-      PLAN1_AMOUNT_5: "$5,854,771",
-      PLAN1_RATE_5: "6.75%",
-      PLAN1_YEAR_6: "第50年",
-      PLAN1_AMOUNT_6: "$8,234,567",
-      PLAN1_RATE_6: "6.70%",
-      PLAN1_YEAR_7: "第100年",
-      PLAN1_AMOUNT_7: "$85,432,189",
-      PLAN1_RATE_7: "6.80%",
-      PLAN_COMPARISON_TITLE: "方案2 or 3：提取后收益对比",
-      PLAN2_YEAR_1: "第20年",
-      LABEL_REMAINING_VALUE: "剩余价值:",
-      PLAN2_REMAINING_VALUE_1: "$2,043,526",
-      LABEL_CUMULATIVE_WITHDRAWAL: "累计提取:",
-      PLAN2_CUMULATIVE_WITHDRAWAL_1: "$1,500,000",
-      PLAN2_RATE_1: "6.31%",
-      PLAN2_YEAR_2: "第30年",
-      PLAN2_REMAINING_VALUE_2: "$11,386,139",
-      PLAN2_CUMULATIVE_WITHDRAWAL_2: "$3,900,000",
-      PLAN2_RATE_2: "6.42%",
-      PLAN2_YEAR_3: "第50年",
-      PLAN2_REMAINING_VALUE_3: "$4,084,398",
-      PLAN2_CUMULATIVE_WITHDRAWAL_3: "$2,700,000",
-      PLAN2_RATE_3: "6.39%",
-      PLAN2_YEAR_4: "第70年",
-      PLAN2_REMAINING_VALUE_4: "$1,463,701",
-      PLAN2_CUMULATIVE_WITHDRAWAL_4: "$720,000",
-      PLAN2_RATE_4: "5.67%",
-      PLAN2_YEAR_5: "第100年",
-      PLAN2_REMAINING_VALUE_5: "$4,084,398",
-      PLAN2_CUMULATIVE_WITHDRAWAL_5: "$2,700,000",
-      PLAN2_RATE_5: "6.39%",
-      PLAN3_YEAR_1: "第20年",
-      PLAN3_REMAINING_VALUE_1: "$1,285,430",
-      PLAN3_CUMULATIVE_WITHDRAWAL_1: "$880,000",
-      PLAN3_RATE_1: "5.45%",
-      PLAN3_YEAR_2: "第30年",
-      PLAN3_REMAINING_VALUE_2: "$1,820,350",
-      PLAN3_CUMULATIVE_WITHDRAWAL_2: "$1,680,000",
-      PLAN3_RATE_2: "6.15%",
-      PLAN3_YEAR_3: "第50年",
-      PLAN3_REMAINING_VALUE_3: "$3,650,280",
-      PLAN3_CUMULATIVE_WITHDRAWAL_3: "$3,280,000",
-      PLAN3_RATE_3: "6.25%",
-      PLAN3_YEAR_4: "第70年",
-      PLAN3_REMAINING_VALUE_4: "$9,850,720",
-      PLAN3_CUMULATIVE_WITHDRAWAL_4: "$4,880,000",
-      PLAN3_RATE_4: "6.28%",
-      PLAN3_YEAR_5: "第100年",
-      PLAN3_REMAINING_VALUE_5: "$3,650,280",
-      PLAN3_CUMULATIVE_WITHDRAWAL_5: "$3,280,000",
-      PLAN3_RATE_5: "6.25%",
-      PLAN_FIXED_ANNUITY_TITLE: "方案2 or 3：固定年金提取",
-      FIXED_ANNUITY_PLAN2_SUBTITLE: "第6年起每年提取6%",
-      LABEL_START_TIME: "开始提取时间:",
-      FIXED_ANNUITY_PLAN2_START_TIME: "第88年",
-      LABEL_DURATION: "提取持续时间:",
-      FIXED_ANNUITY_PLAN2_DURATION: "95年",
-      FIXED_ANNUITY_PLAN2_CUMULATIVE_WITHDRAWAL: "$5,700,000",
-      FIXED_ANNUITY_PLAN2_REMAINING_VALUE: "$8,700,000",
-      FIXED_ANNUITY_PLAN3_SUBTITLE: "第10年起每年提取8%",
-      FIXED_ANNUITY_PLAN3_START_TIME: "第22年",
-      FIXED_ANNUITY_PLAN3_DURATION: "91年",
-      FIXED_ANNUITY_PLAN3_CUMULATIVE_WITHDRAWAL: "$7,280,000",
-      FIXED_ANNUITY_PLAN3_REMAINING_VALUE: "$9,700,000"
-    };
-
-    // Auto-populate with example data on page load
-    window.addEventListener('DOMContentLoaded', function() {
-      populateTemplate(exampleData);
-    });
-
-    // Resize functionality (from original template)
-    (function() {
-      var throttle = function(type, name, obj) {
-        obj = obj || window;
-        var running = false;
-        var func = function() {
-          if (running) { return; }
-          running = true;
-          requestAnimationFrame(function() {
-            obj.dispatchEvent(new CustomEvent(name));
-            running = false;
-          });
-        };
-        obj.addEventListener(type, func);
-      };
-      throttle("resize", "optimizedResize");
-    })();
-
-    function resizePage() {
-      const container = document.getElementById("container");
-      const containerWidth = 384;
-      const containerHeight = 1601;
-      const maxWidth = 2160;
-      
-      // 计算缩放比例，确保不超过2160px
-      const availableWidth = Math.min(window.innerWidth, maxWidth);
-      const scaleX = availableWidth / containerWidth;
-      const scaleY = window.innerHeight / containerHeight;
-      const scale = Math.min(scaleX, scaleY, 1); // 最大缩放比例为1
-      
-      container.style.transform = `translateX(-50%) scale(${scale})`;
-    }
-
-    window.addEventListener("optimizedResize", resizePage);
-    window.addEventListener("DOMContentLoaded", resizePage);
-  </script>
-</body>
-  
-<script>
-const page = {
-  width: 384,
-  height: 1601
-}
-const resizePage = () => {
-  const viewWidth = window.innerWidth
-  const container = document.getElementById('container')
-  const scale = viewWidth / page.width
-  const displayHeight = page.height * scale || 0
-  document.body.style.paddingTop = displayHeight + 'px'
-  container.style.transform = 'scale(' + scale + ')'
-  container.style.display = 'block'
-}
-resizePage();
-(function () {
-  var throttle = function (type, name, obj) {
-    obj = obj || window;
-    var running = false;
-    var func = function () {
-      if (running) { return; }
-      running = true;
-      requestAnimation{{DOCUMENT_TITLE}}(function () {
-        obj.dispatchEvent(new CustomEvent(name));
-        running = false;
-      });
-    };
-    obj.addEventListener(type, func);
-  };
-  throttle("resize", "optimizedResize");
-})();
-window.addEventListener("optimizedResize", resizePage);
-</script>
-
-  </html>
-                """
-    
-    async def download_file(self, url: str, local_path: str) -> bool:
-        """从URL下载文件到本地路径"""
+        """获取HTML模板内容（首先尝试从文件加载，如果失败则使用内嵌模板）"""
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url)
-                response.raise_for_status()
-                
-                with open(local_path, 'wb') as f:
-                    f.write(response.content)
-                
-                logger.info(f"文件下载成功: {url} -> {local_path}")
-                return True
+            if os.path.exists(self.html_template_path):
+                print(f"找到HTML模板文件: {self.html_template_path}")
+                with open(self.html_template_path, 'r', encoding='utf-8') as f:
+                    return f.read()
+            else:
+                # 在这里可以添加内嵌的HTML模板，但由于模板很大，而且文件可以部署到Railway，所以我们不内嵌模板
+                logger.warning(f"HTML模板文件不存在: {self.html_template_path}")
+                return ""
         except Exception as e:
-            logger.error(f"文件下载失败: {url} -> {local_path}, 错误: {e}")
-            return False
+            logger.error(f"读取HTML模板时出错: {e}")
+            return ""
     
     async def upload_file_to_supabase(self, local_path: str, storage_path: str) -> str:
         """上传本地文件到Supabase Storage"""
         try:
-            with open(local_path, 'rb') as f:
-                response = self.supabase.storage.from_('results').upload(storage_path, f)
+            # 确保文件存在
+            if not os.path.exists(local_path):
+                raise FileNotFoundError(f"要上传的文件不存在: {local_path}")
+                
+            # 检查文件大小
+            file_size = os.path.getsize(local_path)
+            print(f"文件大小: {file_size} 字节")
             
-            if response.get('error'):
-                raise Exception(f"上传失败: {response['error']}")
+            # 根据文件扩展名确定MIME类型
+            import mimetypes
+            mime_type, _ = mimetypes.guess_type(local_path)
+            if not mime_type:
+                if storage_path.endswith('.html'):
+                    mime_type = 'text/html'
+                elif storage_path.endswith('.pdf'):
+                    mime_type = 'application/pdf'
+                elif storage_path.endswith('.png'):
+                    mime_type = 'image/png'
+                elif storage_path.endswith('.jpg') or storage_path.endswith('.jpeg'):
+                    mime_type = 'image/jpeg'
+                elif storage_path.endswith('.webp'):
+                    mime_type = 'image/webp'
+                elif storage_path.endswith('.xlsx'):
+                    mime_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                elif storage_path.endswith('.xls'):
+                    mime_type = 'application/vnd.ms-excel'
+                else:
+                    mime_type = 'application/octet-stream'
+                    
+            print(f"上传文件 {local_path} 的MIME类型: {mime_type}")
+            
+            # 添加额外的日志输出
+            print(f"正在使用MIME类型 {mime_type} 上传文件 {local_path} 到 {storage_path}")
+            
+            with open(local_path, 'rb') as f:
+                # 添加明确的MIME类型和缓存控制
+                file_options = {
+                    "content-type": mime_type,
+                    "cache-control": "3600",
+                    "upsert": "true"
+                }
+                
+                print(f"文件选项: {file_options}")
+                
+                self.supabase.storage.from_('results').upload(
+                    storage_path, 
+                    f,
+                    file_options=file_options
+                )
             
             # 生成公开访问URL
             public_url = self.supabase.storage.from_('results').get_public_url(storage_path)
             logger.info(f"文件上传成功: {local_path} -> {storage_path}")
-            return public_url.data['publicUrl']
+            return public_url
             
         except Exception as e:
             logger.error(f"文件上传失败: {local_path} -> {storage_path}, 错误: {e}")
             raise
     
     async def step1_extract_pdf_data(self) -> pd.DataFrame:
-        """步骤1: 下载PDF文件并提取数据"""
-        print("\n=== 步骤1: PDF文件下载和数据提取 ===")
+        """步骤1: 下载PDF并提取数据"""
+        print("\n=== 步骤1: PDF数据提取 ===")
         
         # 下载PDF文件
         print("下载PDF文件...")
-        success1 = await self.download_file(self.scheme1_file_url, self.scheme1_path)
-        success2 = await self.download_file(self.scheme2_file_url, self.scheme2_path)
+        pdf_download_tasks = [
+            self._download_pdf(self.pdf_urls[0], self.scheme1_pdf_path),
+            self._download_pdf(self.pdf_urls[1], self.scheme2_pdf_path)
+        ]
         
-        if not (success1 and success2):
-            print("错误: PDF文件下载失败")
+        results = await asyncio.gather(*pdf_download_tasks)
+        if not all(results):
+            print("错误: PDF下载失败")
             return pd.DataFrame()
         
-        # 使用原脚本逻辑提取数据
-        print("提取PDF数据...")
-        extractor = FinalFilteredExtractor([self.scheme1_path, self.scheme2_path])
+        print(f"PDF下载成功: {self.scheme1_pdf_path}, {self.scheme2_pdf_path}")
+        
+        # 提取PDF数据
+        extractor = FinalFilteredExtractor([self.scheme1_pdf_path, self.scheme2_pdf_path])
         all_data = []
         
         # 处理两个PDF文件
@@ -1985,7 +729,7 @@ window.addEventListener("optimizedResize", resizePage);
         ]
         
         for pdf_path, scheme_name in pdf_files:
-            print(f"\n处理PDF文件: {os.path.basename(pdf_path)} ({scheme_name})")
+            print(f"\n处理PDF文件: {pdf_path} ({scheme_name})")
             
             if not os.path.exists(pdf_path):
                 print(f"错误: PDF文件不存在 - {pdf_path}")
@@ -2039,63 +783,110 @@ window.addEventListener("optimizedResize", resizePage);
         return df
     
     def step2_calculate_irr(self, extracted_df: pd.DataFrame) -> pd.DataFrame:
-        """步骤2: 计算IRR（完全按照原脚本逻辑）"""
-        print("\n=== 步骤2: IRR计算（使用原脚本逻辑） ===")
+        """步骤2: 计算IRR（使用正确的IRR计算器）"""
+        print("\n=== 步骤2: IRR计算（使用正确的IRR计算器） ===")
         
         if extracted_df.empty:
             print("错误: 没有可用的提取数据")
             return pd.DataFrame()
         
-        # 复制数据
-        irr_df = extracted_df.copy()
+        # 初始化结果列表和计算器
+        irr_results = []
+        calculator = CorrectedIRRCalculator()
         
-        # IRR计算函数（完全按照原脚本）
-        def calculate_irr_for_record(record):
+        # 动态获取客户信息（避免硬编码）
+        first_row = extracted_df.iloc[0] if not extracted_df.empty else None
+        if first_row is not None:
+            annual_premium = first_row.get('customer_annual_premium', 200000)  # 使用提取的年保费
+            payment_period = first_row.get('customer_payment_period', 5)  # 缴费期通常为5年
+        else:
+            annual_premium = 200000
+            payment_period = 5
+            
+        print(f"使用提取的客户信息: 年保费=${annual_premium:,}, 缴费期={payment_period}年")
+        
+        for _, row in extracted_df.iterrows():
             try:
-                customer_annual_premium = record.get('customer_annual_premium', 0)
-                customer_payment_period = record.get('customer_payment_period', 0)
-                policy_year = record.get('policy_year', 0)
-                surrender_value = record.get('surrender_value', 0)
+                scheme = row['scheme']
+                table_type = row['table_type']
+                policy_year = int(row['policy_year'])
+                surrender_value = row['surrender_value']
+                withdrawal_amount = row.get('withdrawal_amount', 0)
                 
-                if not all([customer_annual_premium, customer_payment_period, policy_year, surrender_value]):
-                    return None
+                if policy_year <= 0 or surrender_value <= 0:
+                    continue
                 
-                # 构建现金流
-                cash_flows = []
-                
-                # 缴费期现金流（负值）
-                for year in range(1, min(customer_payment_period + 1, policy_year + 1)):
-                    cash_flows.append(-customer_annual_premium)
-                
-                # 如果退保年度超过缴费期，中间年份现金流为0
-                for year in range(customer_payment_period + 1, policy_year):
-                    cash_flows.append(0)
-                
-                # 退保年度的现金流（正值）
-                cash_flows.append(surrender_value)
-                
-                if len(cash_flows) < 2:
-                    return None
+                # 根据table_type选择不同的现金流构建方法（完全按照原脚本逻辑）
+                if table_type == 'surrender_value':
+                    # 一次性退保方案
+                    cash_flows = calculator.build_cash_flows_for_surrender(
+                        annual_premium, payment_period, policy_year, surrender_value
+                    )
+                    withdrawal_start_year = None  # 没有提取
+                    
+                elif table_type == 'withdrawal_surrender_value':
+                    # 现金提取方案（动态确定开始年份）
+                    # 从当前方案的所有现金提取数据中找到第一个非零提取年份
+                    scheme_withdrawal_data = extracted_df[(extracted_df['scheme'] == scheme) & 
+                                               (extracted_df['table_type'] == 'withdrawal_surrender_value') & 
+                                               (extracted_df['withdrawal_amount'] > 0)]
+                    
+                    if not scheme_withdrawal_data.empty:
+                        withdrawal_start_year = int(scheme_withdrawal_data['policy_year'].min())
+                    else:
+                        # 如果没找到，使用硬编码的默认值
+                        if scheme == '方案1':
+                            withdrawal_start_year = 6
+                        elif scheme == '方案2':
+                            withdrawal_start_year = 10
+                        else:
+                            withdrawal_start_year = policy_year
+                    
+                    cash_flows = calculator.build_cash_flows_for_withdrawal(
+                        annual_premium, payment_period, policy_year, 
+                        withdrawal_start_year, withdrawal_amount, surrender_value
+                    )
+                else:
+                    continue
                 
                 # 计算IRR
-                irr = npf.irr(cash_flows)
+                irr = calculator.calculate_irr(cash_flows)
+                irr_percentage = f"{irr * 100:.2f}%" if irr and not np.isnan(irr) else "N/A"
                 
-                if pd.isna(irr) or not np.isfinite(irr):
-                    return None
+                irr_result = {
+                    'scheme': scheme,
+                    'page': row['page'],
+                    'table_type': table_type,
+                    'age': row['age'],
+                    'policy_year': policy_year,
+                    'surrender_value': surrender_value,
+                    'withdrawal_amount': withdrawal_amount,
+                    'annual_premium': annual_premium,
+                    'payment_period': payment_period,
+                    'withdrawal_start_year': withdrawal_start_year if table_type == 'withdrawal_surrender_value' else None,
+                    'cash_flows': str(cash_flows),
+                    'irr': irr_percentage,
+                    'irr_value': irr,
+                    # 添加客户信息列
+                    'customer_name': row.get('customer_name', 'VIP 先生'),
+                    'customer_age': row.get('customer_age', 0),
+                    'customer_annual_premium': row.get('customer_annual_premium', annual_premium),
+                    'customer_payment_period': row.get('customer_payment_period', payment_period),
+                    'customer_total_premium': row.get('customer_total_premium', annual_premium * payment_period),
+                    'customer_currency': row.get('customer_currency', '美元'),
+                    'customer_coverage_period': row.get('customer_coverage_period', '终身')
+                }
                 
-                # 转换为百分比并格式化
-                irr_percentage = irr * 100
-                return f"{irr_percentage:.2f}%"
+                irr_results.append(irr_result)
+                print(f"IRR计算结果: {scheme}, {table_type}, 年份={policy_year}, IRR={irr_percentage}")
                 
             except Exception as e:
-                logger.warning(f"IRR计算错误: {e}")
-                return None
+                print(f"计算IRR时出错: {e}")
+                continue
         
-        # 计算IRR
-        print("开始IRR计算...")
-        irr_df['irr'] = irr_df.apply(calculate_irr_for_record, axis=1)
+        irr_df = pd.DataFrame(irr_results)
         
-        print(f"IRR计算完成:")
+        print(f"\nIRR计算完成:")
         print(f"  总记录数: {len(irr_df)}")
         print(f"  成功计算IRR的记录: {len(irr_df[irr_df['irr'].notna()])}")
         
@@ -2140,15 +931,32 @@ window.addEventListener("optimizedResize", resizePage);
         
         print(f"累计提取金额计算完成，处理了 {len(df[df['cumulative_withdrawal'] > 0])} 条记录")
         
+        # 验证计算结果
+        for scheme in df['scheme'].unique():
+            withdrawal_data = df[(df['scheme'] == scheme) & (df['table_type'] == 'withdrawal_surrender_value')]
+            withdrawal_records = withdrawal_data[withdrawal_data['withdrawal_amount'] > 0].sort_values('policy_year')
+            if not withdrawal_records.empty:
+                print(f"{scheme} 前3条累计提取验证:")
+                for i, (idx, row) in enumerate(withdrawal_records.head(3).iterrows()):
+                    print(f"  第{row['policy_year']}年: 年提取${row['withdrawal_amount']:,}, 累计${row['cumulative_withdrawal']:,}")
+        
         return df
     
     def step3_generate_html(self, irr_df: pd.DataFrame) -> str:
         """步骤3: 生成HTML（根据模板说明和用户要求重新构建）"""
-        print("\n=== 步骤3: HTML生成 ===")
+        print("\n=== 步骤3: HTML生成（重新构建版本） ===")
     
         if irr_df.empty:
             print("错误: 没有IRR数据可供生成HTML")
             return ""
+    
+        # 读取HTML模板
+        html_template = self._get_html_template()
+        if not html_template:
+            print("错误: 无法获取HTML模板")
+            return ""
+    
+        print(f"HTML模板读取成功，长度: {len(html_template)} 字符")
     
         # 分析两个方案的数据
         scheme1_data = irr_df[irr_df['scheme'] == '方案1'].copy()
@@ -2278,20 +1086,168 @@ window.addEventListener("optimizedResize", resizePage);
                 replacements[f'{{{{PLAN1_AMOUNT_{i}}}}}'] = "N/A"
                 replacements[f'{{{{PLAN1_RATE_{i}}}}}'] = "N/A"
     
-        # 应用替换（使用内嵌的HTML模板）
-        html_content = self.html_template_content
+        # 方案2数据填充（现金提取）- 修改为：20年、30年、70岁、90岁、100岁
+        # 计算年龄对应的保单年度（确保至少为1）
+        policy_year_for_age_70 = max(70 - client_age, 1)
+        policy_year_for_age_90 = max(90 - client_age, 1)
+        policy_year_for_age_100 = max(100 - client_age, 1)
+    
+        print(f"70岁对应第{policy_year_for_age_70}年, 90岁对应第{policy_year_for_age_90}年, 100岁对应第{policy_year_for_age_100}年")
+    
+        plan2_years = [20, 30, policy_year_for_age_70, policy_year_for_age_90, policy_year_for_age_100]
+        plan2_labels = [
+            '第20年', 
+            '第30年', 
+            f'第70岁', 
+            f'第90岁', 
+            f'第100岁',
+        ]
+    
+        for i, (policy_year, label) in enumerate(zip(plan2_years, plan2_labels), 1):
+            withdrawal_data = get_data_by_year(scheme1_withdrawal, policy_year)  # 使用方案1的withdrawal数据
+            if withdrawal_data:
+                # 使用已计算的累计提取金额
+                cumulative_withdrawal = withdrawal_data['cumulative_withdrawal']
+            
+                # 计算提取百分比 Y% (累计提取金额 / 总保费)
+                total_premium = customer_info['total_premium']
+                withdrawal_percentage = (cumulative_withdrawal / total_premium * 100) if total_premium > 0 else 0
+            
+                replacements[f'{{{{PLAN2_YEAR_{i}}}}}'] = label
+                replacements[f'{{{{PLAN2_CUMULATIVE_WITHDRAWAL_{i}}}}}'] = f"${cumulative_withdrawal:,}"
+                replacements[f'{{{{PLAN2_REMAINING_VALUE_{i}}}}}'] = f"${withdrawal_data['surrender_value']:,}"
+                replacements[f'{{{{PLAN2_RATE_{i}}}}}'] = withdrawal_data['irr']
+                replacements[f'{{{{PLAN2_WITHDRAWAL_PERCENT_{i}}}}}'] = f"{withdrawal_percentage:.1f}%"
+            else:
+                replacements[f'{{{{PLAN2_YEAR_{i}}}}}'] = label
+                replacements[f'{{{{PLAN2_CUMULATIVE_WITHDRAWAL_{i}}}}}'] = "N/A"
+                replacements[f'{{{{PLAN2_REMAINING_VALUE_{i}}}}}'] = "N/A"
+                replacements[f'{{{{PLAN2_RATE_{i}}}}}'] = "N/A"
+                replacements[f'{{{{PLAN2_WITHDRAWAL_PERCENT_{i}}}}}'] = "N/A"
+    
+        # 方案3数据填充（使用方案2的数据）
+        for i, (policy_year, label) in enumerate(zip(plan2_years, plan2_labels), 1):
+            withdrawal_data = get_data_by_year(scheme2_withdrawal, policy_year)  # 使用方案2的withdrawal数据
+            if withdrawal_data:
+                # 使用已计算的累计提取金额
+                cumulative_withdrawal = withdrawal_data['cumulative_withdrawal']
+            
+                # 计算提取百分比 Y% (累计提取金额 / 总保费)
+                total_premium = customer_info['total_premium']
+                withdrawal_percentage = (cumulative_withdrawal / total_premium * 100) if total_premium > 0 else 0
+            
+                replacements[f'{{{{PLAN3_YEAR_{i}}}}}'] = label
+                replacements[f'{{{{PLAN3_CUMULATIVE_WITHDRAWAL_{i}}}}}'] = f"${cumulative_withdrawal:,}"
+                replacements[f'{{{{PLAN3_REMAINING_VALUE_{i}}}}}'] = f"${withdrawal_data['surrender_value']:,}"
+                replacements[f'{{{{PLAN3_RATE_{i}}}}}'] = withdrawal_data['irr']
+                replacements[f'{{{{PLAN3_WITHDRAWAL_PERCENT_{i}}}}}'] = f"{withdrawal_percentage:.1f}%"
+            else:
+                replacements[f'{{{{PLAN3_YEAR_{i}}}}}'] = label
+                replacements[f'{{{{PLAN3_CUMULATIVE_WITHDRAWAL_{i}}}}}'] = "N/A"
+                replacements[f'{{{{PLAN3_REMAINING_VALUE_{i}}}}}'] = "N/A"
+                replacements[f'{{{{PLAN3_RATE_{i}}}}}'] = "N/A"
+                replacements[f'{{{{PLAN3_WITHDRAWAL_PERCENT_{i}}}}}'] = "N/A"
+    
+        # 固定年金数据 - 根据用户要求动态计算
+        def calculate_fixed_annuity_data(withdrawal_data, scheme_name):
+            """计算固定年金相关数据"""
+            if withdrawal_data.empty:
+                return {
+                    'subtitle': 'N/A',
+                    'start_time': 'N/A',
+                    'duration': 'N/A',
+                    'cumulative_withdrawal': 'N/A',
+                    'remaining_value': 'N/A'
+                }
+        
+            # 找到首个有现金提取的年度
+            withdrawal_records = withdrawal_data[withdrawal_data['withdrawal_amount'] > 0].sort_values('policy_year')
+            if withdrawal_records.empty:
+                return {
+                    'subtitle': 'N/A',
+                    'start_time': 'N/A', 
+                    'duration': 'N/A',
+                    'cumulative_withdrawal': 'N/A',
+                    'remaining_value': 'N/A'
+                }
+        
+            start_year = withdrawal_records.iloc[0]['policy_year']
+            annual_withdrawal = withdrawal_records.iloc[0]['withdrawal_amount']
+            total_premium = customer_info['total_premium']
+        
+            # 计算年提取百分比
+            withdrawal_percentage = (annual_withdrawal / total_premium * 100) if total_premium > 0 else 0
+        
+            # 计算有现金提取的年度总数
+            duration = len(withdrawal_records)
+        
+            # 获取最大的累计现金提取金额
+            max_cumulative = withdrawal_records['cumulative_withdrawal'].max()
+        
+            # 获取最后一个年度的剩余价值
+            last_record = withdrawal_records.iloc[-1]
+            remaining_value = last_record['surrender_value']
+        
+            print(f"{scheme_name}固定年金数据: 起始年度={start_year}, 提取比例={withdrawal_percentage:.1f}%, 持续年数={duration}, 累计提取=${max_cumulative:,.0f}, 剩余价值=${remaining_value:,.0f}")
+        
+            return {
+                'subtitle': f'第{start_year}年起每年提取{withdrawal_percentage:.1f}%',
+                'start_time': f'第{start_year}年',
+                'duration': f'{duration}年',
+                'cumulative_withdrawal': f'${max_cumulative:,.0f}',
+                'remaining_value': f'${remaining_value:,.0f}'
+            }
+    
+        # 计算方案1（PLAN2）固定年金数据
+        plan2_annuity = calculate_fixed_annuity_data(scheme1_withdrawal, "方案1")
+    
+        # 计算方案2（PLAN3）固定年金数据  
+        plan3_annuity = calculate_fixed_annuity_data(scheme2_withdrawal, "方案2")
+    
+        # 固定年金数据填充
+        replacements.update({
+            '{{FIXED_ANNUITY_PLAN2_SUBTITLE}}': plan2_annuity['subtitle'],
+            '{{FIXED_ANNUITY_PLAN2_START_TIME}}': plan2_annuity['start_time'],
+            '{{FIXED_ANNUITY_PLAN2_DURATION}}': plan2_annuity['duration'],
+            '{{FIXED_ANNUITY_PLAN2_CUMULATIVE_WITHDRAWAL}}': plan2_annuity['cumulative_withdrawal'],
+            '{{FIXED_ANNUITY_PLAN2_REMAINING_VALUE}}': plan2_annuity['remaining_value'],
+        
+            '{{FIXED_ANNUITY_PLAN3_SUBTITLE}}': plan3_annuity['subtitle'],
+            '{{FIXED_ANNUITY_PLAN3_START_TIME}}': plan3_annuity['start_time'],
+            '{{FIXED_ANNUITY_PLAN3_DURATION}}': plan3_annuity['duration'],
+            '{{FIXED_ANNUITY_PLAN3_CUMULATIVE_WITHDRAWAL}}': plan3_annuity['cumulative_withdrawal'],
+            '{{FIXED_ANNUITY_PLAN3_REMAINING_VALUE}}': plan3_annuity['remaining_value'],
+        })
+    
+        # 执行替换
+        html_content = html_template
+        replaced_count = 0
         for placeholder, value in replacements.items():
-            html_content = html_content.replace(placeholder, str(value))
+            if placeholder in html_content:
+                html_content = html_content.replace(placeholder, str(value))
+                replaced_count += 1
+    
+        print(f"已替换 {replaced_count} 个占位符")
+    
+        # 处理可能遗留的占位符
+        remaining_placeholders = re.findall(r'\{\{[^}]+\}\}', html_content)
+        if remaining_placeholders:
+            print(f"仍有 {len(remaining_placeholders)} 个占位符未被替换")
+            for placeholder in remaining_placeholders[:10]:  # 只显示前10个
+                print(f"  - {placeholder}")
+                html_content = html_content.replace(placeholder, "N/A")
     
         # 保存HTML文件
         with open(self.final_html_file, 'w', encoding='utf-8') as f:
             f.write(html_content)
-        
+    
         print(f"HTML文件生成完成: {self.final_html_file}")
+        print(f"HTML文件大小: {len(html_content)} 字符")
+    
         return self.final_html_file
     
-    def step4_generate_screenshot(self, html_file: str) -> str:
-        """步骤4: 生成截图（完全按照原脚本逻辑）"""
+    async def step4_generate_screenshot(self, html_file: str) -> str:
+        """步骤4: 生成截图（异步版本）"""
         print("\n=== 步骤4: 截图生成 ===")
         
         if not PLAYWRIGHT_AVAILABLE:
@@ -2303,8 +1259,10 @@ window.addEventListener("optimizedResize", resizePage);
             return ""
         
         try:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(
+            from playwright.async_api import async_playwright
+            
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(
                     headless=True,
                     args=[
                         '--no-sandbox',
@@ -2317,27 +1275,25 @@ window.addEventListener("optimizedResize", resizePage);
                         '--disable-gpu'
                     ]
                 )
-                context = browser.new_context(
+                context = await browser.new_context(
                     viewport={'width': 1200, 'height': 1600},
                     device_scale_factor=2
                 )
-                page = context.new_page()
+                page = await context.new_page()
                 
                 # 加载HTML文件
                 file_url = f"file://{os.path.abspath(html_file)}"
                 print(f"加载HTML文件: {file_url}")
-                page.goto(file_url)
+                await page.goto(file_url)
                 
                 # 等待页面完全加载
-                page.wait_for_load_state("networkidle")
-                page.wait_for_load_state("domcontentloaded")
-                time.sleep(3)  # 额外等待确保所有样式加载完成
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(3)  # 额外等待确保所有样式加载完成 (异步等待)
                 
                 # 滚动到顶部确保内容可见
-                page.evaluate("window.scrollTo(0, 0)")
-                time.sleep(1)
-                
-                print("寻找主要内容容器...")
+                await page.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(1)  # 异步等待
                 
                 # 尝试定位主要内容容器，使用多种选择器
                 container_selectors = [
@@ -2354,16 +1310,17 @@ window.addEventListener("optimizedResize", resizePage);
                     try:
                         # 检查元素是否存在且可见
                         element = page.locator(selector).first
-                        if element.count() > 0:
+                        count = await element.count()
+                        if count > 0:
                             # 检查元素是否有实际内容
-                            bounding_box = element.bounding_box()
+                            bounding_box = await element.bounding_box()
                             if bounding_box and bounding_box['width'] > 100 and bounding_box['height'] > 100:
                                 print(f"找到主要容器: {selector}")
                                 print(f"容器尺寸: {bounding_box}")
                                 
                                 # 直接截取容器元素，不需要手动裁剪
                                 print(f"正在生成超高分辨率截图...")
-                                element.screenshot(
+                                await element.screenshot(
                                     path=self.final_screenshot_file,
                                     type='png'
                                 )
@@ -2377,13 +1334,13 @@ window.addEventListener("optimizedResize", resizePage);
                 # 如果没有找到合适的容器，回退到全页面截图
                 if not container_found:
                     print("未找到合适的容器，使用全页面截图...")
-                    page.screenshot(
+                    await page.screenshot(
                         path=self.final_screenshot_file,
                         full_page=True,
                         type='png'
                     )
                 
-                browser.close()
+                await browser.close()
                 
                 print(f"超高质量截图生成完成: {self.final_screenshot_file}")
                 
@@ -2434,7 +1391,7 @@ window.addEventListener("optimizedResize", resizePage);
                 raise Exception("HTML生成失败")
             
             # 步骤4: 生成截图
-            screenshot_file = self.step4_generate_screenshot(html_file)
+            screenshot_file = await self.step4_generate_screenshot(html_file)
             if not screenshot_file:
                 print("警告: 截图生成失败，但其他步骤已完成")
             
@@ -2465,15 +1422,31 @@ window.addEventListener("optimizedResize", resizePage);
                 )
                 result_urls['excel_url'] = excel_url
             
+            # 计算处理时间
             end_time = datetime.now()
             duration = end_time - start_time
             
             print("\n" + "=" * 60)
-            print("Railway版本流水线执行完成！")
+            print("Railway流水线执行完成！")
             print(f"总耗时: {duration}")
-            print("\n生成的结果URL:")
+            print("\n生成的文件:")
             for key, url in result_urls.items():
-                print(f"  {key}: {url}")
+                print(f"  - {key}: {url}")
+            
+            # 保存结果到数据库（如果Supabase客户端可用）
+            if self.supabase:
+                try:
+                    self.supabase.table('tasks').update({
+                        'status': 'completed',
+                        'results': result_urls,
+                        'completed_at': datetime.now().isoformat()
+                    }).eq('id', self.task_id).execute()
+                    print(f"任务结果已更新到数据库: {self.task_id}")
+                except Exception as e:
+                    logger.error(f"更新任务状态时出错: {e}")
+            
+            # 清理临时文件
+            self._cleanup()
             
             return result_urls
             
@@ -2481,58 +1454,41 @@ window.addEventListener("optimizedResize", resizePage);
             print(f"流水线执行过程中发生错误: {e}")
             import traceback
             traceback.print_exc()
-            raise
-        finally:
+            
+            # 更新任务状态为失败（如果Supabase客户端可用）
+            if self.supabase:
+                try:
+                    self.supabase.table('tasks').update({
+                        'status': 'failed',
+                        'error': str(e),
+                        'completed_at': datetime.now().isoformat()
+                    }).eq('id', self.task_id).execute()
+                    print(f"任务失败状态已更新到数据库: {self.task_id}")
+                except Exception as db_err:
+                    logger.error(f"更新任务失败状态时出错: {db_err}")
+            
             # 清理临时文件
-            if os.path.exists(self.work_dir):
-                shutil.rmtree(self.work_dir, ignore_errors=True)
-                print(f"临时目录已清理: {self.work_dir}")
+            self._cleanup()
+            
+            raise
 
-# Railway API入口函数
-async def process_insurance_pdfs(
-    supabase_url: str,
-    supabase_key: str, 
-    scheme1_file_url: str,
-    scheme2_file_url: str,
-    task_id: str
-) -> Dict[str, str]:
-    """
-    Railway API的主要入口函数
+async def process_insurance_pdfs(pdf_urls, supabase_url=None, supabase_key=None, task_id=None) -> Dict[str, str]:
+    """处理保险PDF文件并返回结果URL
     
     Args:
-        supabase_url: Supabase项目URL
-        supabase_key: Supabase服务密钥
-        scheme1_file_url: 方案1 PDF文件URL
-        scheme2_file_url: 方案2 PDF文件URL
+        pdf_urls: PDF文件URL列表（至少2个）
+        supabase_url: Supabase URL
+        supabase_key: Supabase Key
         task_id: 任务ID
-    
+        
     Returns:
-        Dict[str, str]: 包含结果文件URL的字典
+        Dict[str, str]: 结果文件URL字典
     """
-    pipeline = RailwayCompletePipeline(
+    pipeline = RailwayInsurancePipeline(
+        pdf_urls=pdf_urls,
         supabase_url=supabase_url,
         supabase_key=supabase_key,
-        scheme1_file_url=scheme1_file_url,
-        scheme2_file_url=scheme2_file_url,
         task_id=task_id
     )
     
     return await pipeline.run_complete_pipeline()
-
-if __name__ == "__main__":
-    # 测试代码
-    import asyncio
-    
-    async def test():
-        # 这里需要提供实际的参数进行测试
-        result = await process_insurance_pdfs(
-            supabase_url="your-supabase-url",
-            supabase_key="your-supabase-key",
-            scheme1_file_url="https://example.com/scheme1.pdf",
-            scheme2_file_url="https://example.com/scheme2.pdf", 
-            task_id="test-task-123"
-        )
-        print("处理结果:", result)
-    
-    # asyncio.run(test())
-    print("Railway版本保险IRR分析脚本已就绪")
