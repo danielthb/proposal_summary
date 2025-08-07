@@ -1737,7 +1737,7 @@ video {
       // Replace all placeholders with actual data
       for (const [key, value] of Object.entries(data)) {
         const placeholder = `{{${key}}}`;
-        html = html.replace(new RegExp(placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), value);
+        html = html.replace(new RegExp(placeholder.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'), 'g'), value);
       }
       
       container.innerHTML = html;
