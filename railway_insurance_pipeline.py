@@ -54,6 +54,25 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# 安装Playwright依赖
+def install_playwright_dependencies():
+    """安装Playwright及其浏览器依赖"""
+    try:
+        print("开始安装Playwright依赖...")
+        # 执行安装命令
+        subprocess.run(["pip", "install", "playwright"], check=True)
+        subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
+        subprocess.run(["apt-get", "update"], check=True)
+        subprocess.run(["apt-get", "install", "-y", "libglib2.0-0", "libnss3", "libatk1.0-0", "libatk-bridge2.0-0", "libcups2", "libdrm2", "libxkbcommon0", "libxcomposite1", "libxdamage1", "libxfixes3", "libxrandr2", "libgbm1", "libasound2"], check=True)
+        print("Playwright依赖安装完成")
+        return True
+    except Exception as e:
+        print(f"Playwright依赖安装失败: {e}")
+        return False
+
+# 尝试安装Playwright依赖
+install_playwright_dependencies()
+
 # 添加正确的IRR计算器类
 class CorrectedIRRCalculator:
     """修正的IRR计算器（完全按照原脚本）"""
