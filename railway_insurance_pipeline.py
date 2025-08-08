@@ -54,16 +54,39 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 安装Playwright依赖
+# 安装Playwright依赖 - 已更新修复依赖问题
 def install_playwright_dependencies():
-    """安装Playwright及其浏览器依赖"""
+    """安装Playwright及其浏览器依赖 - 已修复Railway依赖问题"""
     try:
         print("开始安装Playwright依赖...")
         # 执行安装命令
         subprocess.run(["pip", "install", "playwright"], check=True)
         subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
+        
+        # 安装错误提示中列出的所有依赖
+        dependencies = [
+            "libglib2.0-0t64",
+            "libnspr4",
+            "libnss3",
+            "libdbus-1-3",
+            "libatk1.0-0t64",
+            "libatk-bridge2.0-0t64",
+            "libatspi2.0-0t64",
+            "libx11-6",
+            "libxcomposite1",
+            "libxdamage1",
+            "libxext6",
+            "libxfixes3",
+            "libxrandr2",
+            "libgbm1",
+            "libxcb1",
+            "libxkbcommon0",
+            "libasound2t64"
+        ]
+        
+        # 更新包列表并安装依赖
         subprocess.run(["apt-get", "update"], check=True)
-        subprocess.run(["apt-get", "install", "-y", "libglib2.0-0", "libnss3", "libatk1.0-0", "libatk-bridge2.0-0", "libcups2", "libdrm2", "libxkbcommon0", "libxcomposite1", "libxdamage1", "libxfixes3", "libxrandr2", "libgbm1", "libasound2"], check=True)
+        subprocess.run(["apt-get", "install", "-y"] + dependencies, check=True)
         print("Playwright依赖安装完成")
         return True
     except Exception as e:
@@ -601,6 +624,13 @@ class RailwayInsurancePipeline:
         # HTML模板路径（先尝试从当前目录加载，如果不存在，使用内嵌模板）
         self.html_template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "两套方案对比HTML模板_含占位符_修正7.html")
         
+        # 确保安装 Playwright 依赖
+        if PLAYWRIGHT_AVAILABLE:
+            print("确保Playwright依赖已安装...")
+            install_playwright_dependencies()
+        else:
+            logger.warning("Playwright 不可用，截图功能将不可用")
+    
     def _cleanup(self):
         """清理临时文件和目录"""
         try:
@@ -963,7 +993,7 @@ class RailwayInsurancePipeline:
                         years_of_withdrawal = policy_year - actual_start_year + 1
                         df.loc[idx, 'cumulative_withdrawal'] = withdrawal_amount * years_of_withdrawal
         
-        print(f"累计提取金额计算完成，处理了 {len(df[df['cumulative_withdrawal'] > 0])} 条记录")
+        print(f"累计提取金额计算完成，处理了 {len(df[df['cumulative_withdrawal'] > 0)} 条记录")
         
         # 验证计算结果
         for scheme in df['scheme'].unique():
@@ -1281,7 +1311,7 @@ class RailwayInsurancePipeline:
         return self.final_html_file
     
     async def step4_generate_screenshot(self, html_file: str) -> str:
-        """步骤4: 生成截图（异步版本）"""
+        """步骤4: 生成截图（异步版本）- 已添加依赖修复"""
         print("\n=== 步骤4: 截图生成 ===")
         
         if not PLAYWRIGHT_AVAILABLE:
@@ -1291,6 +1321,10 @@ class RailwayInsurancePipeline:
         if not html_file or not os.path.exists(html_file):
             print(f"错误: HTML文件不存在 - {html_file}")
             return ""
+        
+        # 确保依赖已安装 - 双重检查
+        print("确保Playwright依赖已安装...")
+        install_playwright_dependencies()
         
         try:
             from playwright.async_api import async_playwright
