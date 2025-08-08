@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Railway适用的保险方案处理流水线（完整修复版）
+Railway适用的保险方案处理流水线
 ====================================
 
 基于correct_complete_pipeline.py修改，适配云环境：
@@ -9,13 +9,8 @@ Railway适用的保险方案处理流水线（完整修复版）
 2. 结果上传到Supabase而不是保存到本地文件系统
 3. 异步处理支持
 
-修复以下问题：
-1. 文件名过长问题 - 通过安全地解析URL路径
-2. 数据库列名错误 - error_message而不是error
-3. Playwright浏览器不存在问题 - 通过优雅地处理错误，跳过截图但不中断整个流程
-
 作者: MiniMax Agent
-日期: 2025-08-08
+日期: 2025-08-07
 """
 
 import pdfplumber
@@ -37,7 +32,27 @@ import asyncio
 import httpx
 import mimetypes
 import uuid
-from urllib.parse import urlparse, unquote
+
+# 安装Playwright依赖
+def install_playwright_dependencies():
+    """安装Playwright及其浏览器依赖"""
+    try:
+        print("开始安装Playwright依赖...")
+        # 安装playwright
+        subprocess.run(["pip", "install", "playwright"], check=True)
+        # 安装chromium浏览器
+        subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
+        # 安装系统依赖
+        subprocess.run(["apt-get", "update"], check=True)
+        subprocess.run(["apt-get", "install", "-y", "libglib2.0-0", "libnss3", "libatk1.0-0", "libatk-bridge2.0-0", "libcups2", "libdrm2", "libxkbcommon0", "libxcomposite1", "libxdamage1", "libxfixes3", "libxrandr2", "libgbm1", "libasound2"], check=True)
+        print("Playwright依赖安装完成")
+        return True
+    except Exception as e:
+        print(f"Playwright依赖安装失败: {e}")
+        return False
+
+# 尝试安装Playwright依赖
+install_playwright_dependencies()
 
 # Playwright用于截图
 try:
@@ -304,304 +319,205 @@ class FinalFilteredExtractor:
                         
                         # 查找包含"年"的列，可能是缴费期
                         for cell in row:
-                            if cell and isinstance(cell, str):
-                                if "5" in cell and "终身" in " ".join(row):
-                                    customer_info['payment_period'] = 5
-                                if "终身" in cell:
-                                    customer_info['coverage_period'] = "终身"
+                            if not cell or not isinstance(cell, str):
+                                continue
+                                
+                            cell = cell.strip()
+                            
+                            # 匹配缴费期 (例如 "5年")
+                            if re.search(r'(\d+)\s*年\s*交', cell) or re.search(r'缴费期[:：]?\s*(\d+)\s*年', cell):
+                                match = re.search(r'(\d+)', cell)
+                                if match:
+                                    customer_info['payment_period'] = int(match.group(1))
+                                    logger.info(f"提取到缴费期: {customer_info['payment_period']}年")
+                            
+                            # 匹配保障期 (例如 "终身" 或 "至80岁")
+                            if "终身" in cell or "whole life" in cell.lower() or "life" in cell.lower():
+                                customer_info['coverage_period'] = "终身"
+                                logger.info("提取到保障期: 终身")
+                            elif re.search(r'至\s*(\d+)\s*[岁歲]', cell):
+                                match = re.search(r'至\s*(\d+)\s*[岁歲]', cell)
+                                if match:
+                                    customer_info['coverage_period'] = f"至{match.group(1)}岁"
+                                    logger.info(f"提取到保障期: {customer_info['coverage_period']}")
                 
-                # 设置默认值
-                if customer_info['payment_period'] is None:
-                    customer_info['payment_period'] = 5     # 默认5年
-                if customer_info['coverage_period'] is None:
-                    customer_info['coverage_period'] = "终身"  # 默认终身
-                
-                # 计算总保费（基础保费 × 缴费年数）
-                if customer_info['annual_premium'] and customer_info['payment_period']:
-                    total_premium = customer_info['annual_premium'] * customer_info['payment_period']
-                    customer_info['total_premium'] = round(total_premium)  # 四舍五入到整数
-                    logger.info(f"计算总保费: {customer_info['annual_premium']} × {customer_info['payment_period']} = {customer_info['total_premium']}")
-                
-                print(f"改进版提取客户信息: 姓名={customer_info['name']}, 年龄={customer_info['age']}, 年缴保费=${customer_info['annual_premium']:,}")
-                logger.info(f"客户信息: {customer_info}")
+                # 计算总保费
+                customer_info['total_premium'] = customer_info['annual_premium'] * customer_info['payment_period']
                 
         except Exception as e:
             logger.error(f"提取客户信息时出错: {e}")
             
         return customer_info
-    
-    def should_exclude_page(self, text: str) -> bool:
-        """检查页面是否应该被排除（完全按照原脚本）"""
-        for exclude_keyword in self.exclude_rules:
-            if exclude_keyword in text:
-                return True
-        return False
-    
-    def find_table_pages(self, pdf_path: str) -> Dict[str, List[int]]:
-        """查找包含特定表格的页面，并应用排除规则（完全按照原脚本）"""
-        table_pages = {
-            'surrender_value': [],  # 退保发还金额
-            'withdrawal_surrender_value': [],  # 现金提取后之退保发还金额
-        }
-        
+
+    def extract_table_data_by_pattern(self, pdf_path: str, header_patterns: List[str], page_range: List[int] = None) -> List[List[str]]:
+        """根据表头模式提取表格数据"""
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                if page_range is None:
+                    pages = pdf.pages
+                else:
+                    start_page = max(0, page_range[0])
+                    end_page = min(len(pdf.pages), page_range[1] if len(page_range) > 1 else start_page + 1)
+                    pages = pdf.pages[start_page:end_page]
+                
+                for page in pages:
+                    tables = page.extract_tables()
+                    
+                    for table in tables:
+                        if not table or len(table) < 2:
+                            continue
+                        
+                        # 检查表头是否匹配所有模式
+                        header_row = [str(cell).strip() if cell else "" for cell in table[0]]
+                        header_text = " ".join(header_row)
+                        
+                        if all(pattern in header_text for pattern in header_patterns):
+                            return table
+            
+            return []
+            
+        except Exception as e:
+            logger.error(f"按模式提取表格数据时出错: {e}")
+            return []
+
+    def find_surrender_value_table_page(self, pdf_path: str) -> int:
+        """查找包含退保价值表的页面"""
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 for page_num, page in enumerate(pdf.pages, 1):
                     text = page.extract_text()
-                    if not text:
-                        continue
-                    
-                    # 首先检查是否应该排除此页面
-                    if self.should_exclude_page(text):
-                        logger.info(f"第{page_num}页包含排除关键字，跳过")
-                        continue
-                    
-                    # 然后检查是否包含目标表格
-                    if "退保发还金额" in text and "现金提取后之退保发还金额" not in text:
-                        table_pages['surrender_value'].append(page_num)
-                        logger.info(f"第{page_num}页包含'退保发还金额'表格")
-                    elif "现金提取后之退保发还金额" in text:
-                        table_pages['withdrawal_surrender_value'].append(page_num)
-                        logger.info(f"第{page_num}页包含'现金提取后之退保发还金额'表格")
-                        
+                    if text and any(keyword in text for keyword in ['退保价值', '现金价值', '退保金额', 'Surrender', 'Cash Value']):
+                        return page_num - 1  # 返回页面索引
         except Exception as e:
-            logger.error(f"查找表格页面时出错: {e}")
-            
-        return table_pages
-    
-    def parse_newline_separated_data(self, cell_content: str) -> List[str]:
-        """解析用换行符分隔的5年数据（完全按照原脚本）"""
-        if not cell_content or pd.isna(cell_content):
-            return []
-        
-        parts = str(cell_content).split('\n')
-        cleaned_parts = []
-        for part in parts:
-            part = part.strip()
-            if part:
-                part = part.replace(',', '')
-                cleaned_parts.append(part)
-        
-        return cleaned_parts[:5]
-    
-    def find_column_indices(self, table: List[List], table_type: str) -> Dict[str, int]:
-        """精确查找列索引（完全按照原脚本）"""
-        column_indices = {}
-        
-        if not table or len(table) < 2:
-            return column_indices
-        
-        # 显示表格结构用于调试
-        logger.info(f"表格结构分析 ({table_type}):")
-        for row_idx, row in enumerate(table[:4]):
-            logger.info(f"  第{row_idx + 1}行: {row}")
-        
-        # 查找年龄列（第1列，固定）
-        column_indices['age'] = 0
-        
-        # 查找保单年度终结列（在第1行中查找）
-        if len(table) > 0:
-            header_row1 = table[0]
-            for col_idx, cell in enumerate(header_row1):
-                if cell and '保单' in str(cell) and '年度' in str(cell):
-                    column_indices['policy_year'] = col_idx
-                    logger.info(f"找到保单年度终结列: 第{col_idx + 1}列")
-                    break
-            
-            # 如果没找到，使用默认位置（通常是第2列）
-            if 'policy_year' not in column_indices:
-                column_indices['policy_year'] = 1
-                logger.info(f"使用默认保单年度终结列: 第2列")
-        
-        # 查找总额列（在第2行中查找）
-        if len(table) > 1:
-            header_row2 = table[1]
-            for col_idx, cell in enumerate(header_row2):
-                if cell and '总额' in str(cell):
-                    column_indices['total_amount'] = col_idx
-                    logger.info(f"找到总额列: 第{col_idx + 1}列")
-                    break
-        
-        # 查找现金提取金额列（在第1行中查找）
-        if len(table) > 0:
-            header_row1 = table[0]
-            for col_idx, cell in enumerate(header_row1):
-                if cell and '现金提取' in str(cell) and '金额' in str(cell):
-                    column_indices['withdrawal_amount'] = col_idx
-                    logger.info(f"找到现金提取金额列: 第{col_idx + 1}列")
-                    break
-        
-        logger.info(f"最终列索引: {column_indices}")
-        return column_indices
-    
-    def extract_table_data_filtered(self, pdf_path: str, page_numbers: List[int], table_type: str) -> List[Dict]:
-        """从指定页面提取过滤后的表格数据（完全按照原脚本）"""
-        all_data = []
-        
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                for page_num in page_numbers:
-                    if page_num <= len(pdf.pages):
-                        page = pdf.pages[page_num - 1]
-                        tables = page.extract_tables()
-                        
-                        logger.info(f"第{page_num}页包含 {len(tables)} 个表格")
-                        
-                        for table_idx, table in enumerate(tables):
-                            if not table or len(table) < 3:
-                                continue
-                            
-                            # 查找列索引
-                            column_indices = self.find_column_indices(table, table_type)
-                            
-                            if not column_indices:
-                                logger.warning(f"第{page_num}页表格{table_idx + 1}无法找到有效列索引")
-                                continue
-                            
-                            # 从第3行开始提取数据（跳过表头）
-                            for row_idx in range(2, len(table)):
-                                row = table[row_idx]
-                                
-                                if len(row) <= max(column_indices.values()):
-                                    continue
-                                
-                                # 提取各列数据
-                                age_cell = row[column_indices['age']] if 'age' in column_indices else None
-                                policy_year_cell = row[column_indices['policy_year']] if 'policy_year' in column_indices else None
-                                total_amount_cell = row[column_indices['total_amount']] if 'total_amount' in column_indices else None
-                                withdrawal_cell = row[column_indices['withdrawal_amount']] if 'withdrawal_amount' in column_indices else None
-                                
-                                # 解析各列的5年数据
-                                age_values = self.parse_newline_separated_data(age_cell)
-                                policy_year_values = self.parse_newline_separated_data(policy_year_cell)
-                                total_amount_values = self.parse_newline_separated_data(total_amount_cell)
-                                withdrawal_values = self.parse_newline_separated_data(withdrawal_cell) if withdrawal_cell else []
-                                
-                                logger.info(f"第{row_idx + 1}行数据:")
-                                logger.info(f"  年龄: {age_values}")
-                                logger.info(f"  保单年度: {policy_year_values}")
-                                logger.info(f"  总额: {total_amount_values}")
-                                logger.info(f"  现金提取: {withdrawal_values}")
-                                
-                                # 验证数据一致性
-                                if not age_values or not policy_year_values or not total_amount_values:
-                                    logger.warning(f"第{row_idx + 1}行数据不完整，跳过")
-                                    continue
-                                
-                                # 确保数据长度一致（都应该是5个）
-                                min_length = min(len(age_values), len(policy_year_values), len(total_amount_values))
-                                min_length = min(min_length, 5)
-                                
-                                # 生成数据记录
-                                for year_offset in range(min_length):
-                                    try:
-                                        age = int(age_values[year_offset])
-                                        policy_year = int(policy_year_values[year_offset])
-                                        
-                                        # 检查是否是每5年汇总行
-                                        if policy_year % 5 == 0 or policy_year == 1:
-                                            total_amount = float(total_amount_values[year_offset])
-                                            
-                                            data = {
-                                                'age': age,
-                                                'policy_year': policy_year,
-                                                'total_amount': total_amount
-                                            }
-                                            
-                                            # 如果有现金提取数据，添加
-                                            if withdrawal_values and year_offset < len(withdrawal_values) and withdrawal_values[year_offset]:
-                                                try:
-                                                    data['withdrawal_amount'] = float(withdrawal_values[year_offset])
-                                                except:
-                                                    pass
-                                            
-                                            all_data.append(data)
-                                    except Exception as e:
-                                        logger.error(f"解析第{row_idx + 1}行数据时出错: {e}")
-        
-        except Exception as e:
-            logger.error(f"提取表格数据时出错: {e}")
-        
-        return all_data
-    
+            logger.error(f"查找退保价值表页面时出错: {e}")
+        return 3  # 默认返回第4页
+
     def extract_surrender_values(self, pdf_path: str) -> Dict[int, float]:
-        """提取退保发还金额表（按保单年度）"""
-        print(f"\n处理PDF文件: {os.path.basename(pdf_path)} (退保发还金额)")
+        """提取退保价值表数据"""
         surrender_values = {}
-        
         try:
-            # 查找包含退保发还金额表的页面
-            table_pages = self.find_table_pages(pdf_path)
+            start_page = self.find_surrender_value_table_page(pdf_path)
             
-            if not table_pages['surrender_value']:
-                logger.warning(f"未找到退保发还金额表: {pdf_path}")
-                return surrender_values
+            with pdfplumber.open(pdf_path) as pdf:
+                # 搜索连续3页
+                for page_idx in range(start_page, min(start_page + 3, len(pdf.pages))):
+                    page = pdf.pages[page_idx]
+                    tables = page.extract_tables()
+                    
+                    for table in tables:
+                        if not table or len(table) < 2:
+                            continue
+                            
+                        # 判断是否是退保价值表
+                        header_row = [str(cell).strip() if cell else "" for cell in table[0]]
+                        header_text = " ".join(header_row)
+                        
+                        if any(keyword in header_text for keyword in ['退保价值', '现金价值', '退保金额', 'Surrender', 'Cash Value']):
+                            # 确定年份列和价值列的索引
+                            year_col_idx = None
+                            value_col_idx = None
+                            
+                            for i, cell in enumerate(header_row):
+                                if '年' in cell or 'Year' in cell:
+                                    year_col_idx = i
+                                if any(keyword in cell for keyword in ['退保价值', '现金价值', '退保金额', 'Surrender', 'Cash Value']):
+                                    value_col_idx = i
+                            
+                            if year_col_idx is not None and value_col_idx is not None:
+                                # 提取数据行
+                                for row in table[1:]:
+                                    if len(row) <= max(year_col_idx, value_col_idx) or not row[year_col_idx] or not row[value_col_idx]:
+                                        continue
+                                    
+                                    # 提取年份
+                                    year_cell = str(row[year_col_idx]).strip()
+                                    year_match = re.search(r'(\d+)', year_cell)
+                                    if not year_match:
+                                        continue
+                                    year = int(year_match.group(1))
+                                    
+                                    # 提取价值
+                                    value_cell = str(row[value_col_idx]).strip()
+                                    value_match = re.search(r'([\d,]+(?:\.\d+)?)', value_cell.replace(',', ''))
+                                    if not value_match:
+                                        continue
+                                    value = float(value_match.group(1).replace(',', ''))
+                                    
+                                    surrender_values[year] = value
+                                    logger.info(f"提取到第{year}年退保价值: {value}")
+                            
+                            # 如果已找到退保价值表，直接返回
+                            if surrender_values:
+                                return surrender_values
             
-            # 从这些页面提取表格数据
-            data = self.extract_table_data_filtered(pdf_path, table_pages['surrender_value'], '退保发还金额')
-            
-            # 将数据转换为字典格式 {年份: 金额}
-            for item in data:
-                policy_year = item.get('policy_year')
-                total_amount = item.get('total_amount')
-                
-                if policy_year is not None and total_amount is not None:
-                    surrender_values[policy_year] = total_amount
-            
-            # 显示提取结果
-            print(f"提取到 {len(surrender_values)} 条退保发还金额数据")
+            if not surrender_values:
+                logger.warning(f"未找到退保价值表: {pdf_path}")
             
             return surrender_values
             
         except Exception as e:
-            logger.error(f"提取退保发还金额表时出错: {e}")
+            logger.error(f"提取退保价值表时出错: {e}")
             return surrender_values
-    
+
     def extract_withdrawal_values(self, pdf_path: str) -> Dict[int, float]:
-        """提取现金提取后之退保发还金额表（按保单年度）"""
-        print(f"\n处理PDF文件: {os.path.basename(pdf_path)} (现金提取方案)")
+        """提取最优领取方案数据"""
         withdrawal_values = {}
-        
         try:
-            # 查找包含现金提取表的页面
-            table_pages = self.find_table_pages(pdf_path)
-            
-            if table_pages['withdrawal_surrender_value']:
-                # 提取表格数据
-                data = self.extract_table_data_filtered(pdf_path, table_pages['withdrawal_surrender_value'], '现金提取后之退保发还金额')
-                
-                # 将数据转换为字典格式 {年份: 提取金额}
-                for item in data:
-                    policy_year = item.get('policy_year')
-                    withdrawal_amount = item.get('withdrawal_amount')
-                    
-                    if policy_year is not None and withdrawal_amount is not None:
-                        withdrawal_values[policy_year] = withdrawal_amount
-                
-                print(f"提取到 {len(withdrawal_values)} 条现金提取金额数据")
-                return withdrawal_values
-        
-            # 尝试特殊处理：有些PDF不在表格中包含提取金额，而是在文本中说明
             with pdfplumber.open(pdf_path) as pdf:
-                for page in pdf.pages:
+                # 从第10页开始搜索
+                start_page = 9  # 0-indexed
+                end_page = min(start_page + 5, len(pdf.pages))
+                
+                for page_idx in range(start_page, end_page):
+                    page = pdf.pages[page_idx]
                     text = page.extract_text()
-                    if not text:
-                        continue
+                    tables = page.extract_tables()
                     
-                    # 查找包含年度提取描述的段落
-                    lines = text.split('\n')
-                    for line in lines:
-                        if "现金提取" in line and "%" in line:
-                            matches = re.findall(r'(\d+)%.*?(\d+(?:\.\d+)?)', line)
-                            if matches:
-                                for year_pct, amount in matches:
-                                    try:
-                                        year = int(year_pct)
-                                        value = float(amount.replace(',', ''))
-                                        withdrawal_values[year] = value
-                                    except:
-                                        pass
+                    # 如果页面文本包含关键词，则可能包含领取方案
+                    if text and any(keyword in text for keyword in ['领取方案', '年金', '定期提取', '累积领取']):
+                        for table in tables:
+                            if not table or len(table) < 2:
+                                continue
                                 
+                            # 合并表头判断是否是领取方案表
+                            header_row = [str(cell).strip() if cell else "" for cell in table[0]]
+                            header_text = " ".join(header_row)
+                            
+                            if any(keyword in header_text for keyword in ['领取方案', '年金', '定期提取', '累积领取']):
+                                # 确定年份列和领取金额列的索引
+                                year_col_idx = None
+                                value_col_idx = None
+                                
+                                for i, cell in enumerate(header_row):
+                                    if '年' in cell or 'Year' in cell:
+                                        year_col_idx = i
+                                    if any(keyword in cell for keyword in ['领取', '提取', '年金', 'Income', 'Withdrawal']):
+                                        value_col_idx = i
+                                
+                                if year_col_idx is not None and value_col_idx is not None:
+                                    # 提取数据行
+                                    for row in table[1:]:
+                                        if len(row) <= max(year_col_idx, value_col_idx) or not row[year_col_idx] or not row[value_col_idx]:
+                                            continue
+                                        
+                                        # 提取年份
+                                        year_cell = str(row[year_col_idx]).strip()
+                                        year_match = re.search(r'(\d+)', year_cell)
+                                        if not year_match:
+                                            continue
+                                        year = int(year_match.group(1))
+                                        
+                                        # 提取领取金额
+                                        value_cell = str(row[value_col_idx]).strip()
+                                        value_match = re.search(r'([\d,]+(?:\.\d+)?)', value_cell.replace(',', ''))
+                                        if not value_match:
+                                            continue
+                                        value = float(value_match.group(1).replace(',', ''))
+                                        
+                                        withdrawal_values[year] = value
+                                        logger.info(f"提取到第{year}年领取金额: {value}")
+                                
+                                # 如果已找到领取方案表，直接返回
                                 if withdrawal_values:
                                     return withdrawal_values
                 
@@ -705,39 +621,33 @@ class RailwayInsurancePipeline:
             raise ValueError("需要至少两个PDF文件URL")
         
         # 设置临时文件路径 - 使用安全的文件名
-        self.scheme1_pdf_path = os.path.join(self.temp_dir, f"scheme1_{self._safe_filename(self.pdf_urls[0])}")
-        self.scheme2_pdf_path = os.path.join(self.temp_dir, f"scheme2_{self._safe_filename(self.pdf_urls[1])}")
-        
-        # 设置输出文件路径
-        self.extracted_data_file = os.path.join(self.temp_dir, "计划书数据提取结果.xlsx")
-        self.irr_results_file = os.path.join(self.temp_dir, "IRR计算结果.xlsx")
-        self.final_html_file = os.path.join(self.temp_dir, "保险方案对比报告.html")
-        self.final_screenshot_file = os.path.join(self.temp_dir, "保险方案对比报告.png")
-    
-    def _safe_filename(self, url: str) -> str:
-        """从URL安全地提取文件名（修复文件名过长问题）"""
-        try:
-            # 将URL拆分，只保留基本部分（无查询参数）
-            url_parts = url.split('?')[0]
-            # 从URL路径中提取文件名
-            base_name = os.path.basename(url_parts)
-            # 如果文件名太长或不是PDF，使用随机名称
+        def safe_filename(url):
+            # 先提取基本文件名
+            base_name = os.path.basename(url.split('?')[0])
+            # 如果还包含非法字符，则生成随机文件名
             if len(base_name) > 50 or not base_name.endswith('.pdf'):
                 return f"{uuid.uuid4().hex}.pdf"
             return base_name
-        except Exception as e:
-            logger.error(f"处理URL文件名时出错: {url}, 错误: {e}")
-            # 安全回退：生成随机文件名
-            return f"{uuid.uuid4().hex}.pdf"
-    
+            
+        self.scheme1_pdf_path = os.path.join(self.temp_dir, f"scheme1_{safe_filename(self.pdf_urls[0])}")
+        self.scheme2_pdf_path = os.path.join(self.temp_dir, f"scheme2_{safe_filename(self.pdf_urls[1])}")
+        
+        # 设置输出文件路径
+        self.extracted_data_file = os.path.join(self.temp_dir, "计划书数据提取结果.xlsx")
+        self.irr_results_file = os.path.join(self.temp_dir, "计划书数据提取结果_含IRR计算.xlsx")
+        self.final_html_file = os.path.join(self.temp_dir, "report.html")
+        self.final_screenshot_file = os.path.join(self.temp_dir, "screenshot.png")
+        
+        # HTML模板路径（先尝试从当前目录加载，如果不存在，使用内嵌模板）
+        self.html_template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "两套方案对比HTML模板_含占位符_修正7.html")
+        
     def _cleanup(self):
-        """清理临时文件"""
+        """清理临时文件和目录"""
         try:
-            if os.path.exists(self.temp_dir):
-                shutil.rmtree(self.temp_dir)
-                print(f"临时目录已清理: {self.temp_dir}")
+            shutil.rmtree(self.temp_dir)
+            print(f"临时目录已清理: {self.temp_dir}")
         except Exception as e:
-            logger.error(f"清理临时文件时出错: {e}")
+            logger.error(f"清理临时目录时出错: {e}")
     
     async def _download_pdf(self, url: str, local_path: str) -> bool:
         """从URL下载PDF文件到本地路径"""
@@ -753,10 +663,6 @@ class RailwayInsurancePipeline:
                 
                 bucket_name = parts[0]
                 storage_path = "/".join(parts[1:])
-                
-                # 如果包含查询参数，去除
-                if "?" in storage_path:
-                    storage_path = storage_path.split("?")[0]
                 
                 # 下载文件
                 try:
@@ -797,10 +703,6 @@ class RailwayInsurancePipeline:
             logger.error("Supabase客户端未初始化，无法上传文件")
             return None
         
-        if not os.path.exists(local_path):
-            logger.error(f"要上传的文件不存在: {local_path}")
-            return None
-        
         try:
             # 检查bucket是否存在，不存在则创建
             buckets = self.supabase.storage.list_buckets()
@@ -837,7 +739,7 @@ class RailwayInsurancePipeline:
             
         except Exception as e:
             logger.error(f"文件上传失败: {local_path} -> {storage_path}, 错误: {e}")
-            return None
+            raise
     
     async def step1_extract_pdf_data(self) -> pd.DataFrame:
         """步骤1: 下载PDF并提取数据"""
@@ -850,29 +752,23 @@ class RailwayInsurancePipeline:
             self._download_pdf(self.pdf_urls[1], self.scheme2_pdf_path)
         ]
         
-        try:
-            results = await asyncio.gather(*pdf_download_tasks)
-            if not all(results):
-                print("错误: PDF下载失败")
-                return pd.DataFrame()
-            
-            print(f"PDF下载成功: {self.scheme1_pdf_path}, {self.scheme2_pdf_path}")
-            
-            # 提取数据
-            print("提取PDF数据...")
-            extractor = FinalFilteredExtractor([self.scheme1_pdf_path, self.scheme2_pdf_path])
-            df = extractor.extract_proposal_data(self.scheme1_pdf_path, self.scheme2_pdf_path)
-            
-            # 保存提取的数据
-            df.to_excel(self.extracted_data_file, index=False)
-            print(f"数据提取完成，已保存到: {self.extracted_data_file}")
-            
-            return df
-        except Exception as e:
-            logger.error(f"PDF数据提取失败: {e}")
-            import traceback
-            traceback.print_exc()
+        results = await asyncio.gather(*pdf_download_tasks)
+        if not all(results):
+            print("错误: PDF下载失败")
             return pd.DataFrame()
+        
+        print(f"PDF下载成功: {self.scheme1_pdf_path}, {self.scheme2_pdf_path}")
+        
+        # 提取数据
+        print("提取PDF数据...")
+        extractor = FinalFilteredExtractor([self.scheme1_pdf_path, self.scheme2_pdf_path])
+        df = extractor.extract_proposal_data(self.scheme1_pdf_path, self.scheme2_pdf_path)
+        
+        # 保存提取的数据
+        df.to_excel(self.extracted_data_file, index=False)
+        print(f"数据提取完成，已保存到: {self.extracted_data_file}")
+        
+        return df
     
     def step2_calculate_irr(self, df: pd.DataFrame) -> pd.DataFrame:
         """步骤2: 计算IRR"""
@@ -882,656 +778,379 @@ class RailwayInsurancePipeline:
             print("错误: 无数据可计算IRR")
             return df
         
-        try:
-            # 创建结果数据框
-            results = []
-            
-            # 提取客户信息
-            s1_annual_premium = df['scheme1_annual_premium'].iloc[0]
-            s1_payment_period = df['scheme1_payment_period'].iloc[0]
-            s1_surrender_values = df['scheme1_surrender_values'].iloc[0]
-            s1_withdrawal_values = df['scheme1_withdrawal_values'].iloc[0]
-            
-            s2_annual_premium = df['scheme2_annual_premium'].iloc[0]
-            s2_payment_period = df['scheme2_payment_period'].iloc[0]
-            s2_surrender_values = df['scheme2_surrender_values'].iloc[0]
-            s2_withdrawal_values = df['scheme2_withdrawal_values'].iloc[0]
-            
-            # 按年度计算IRR
-            irr_years = sorted(set(list(s1_surrender_values.keys()) + list(s2_surrender_values.keys())))
-            
-            for policy_year in irr_years:
-                if policy_year < max(s1_payment_period, s2_payment_period):
-                    continue  # 跳过缴费期内的年份
-                
-                # 方案1的退保IRR
-                s1_surrender_irr = 0
-                if policy_year in s1_surrender_values:
-                    surrender_value = s1_surrender_values[policy_year]
-                    cash_flows = CorrectedIRRCalculator.build_cash_flows_for_surrender(
-                        s1_annual_premium, s1_payment_period, policy_year, surrender_value
-                    )
-                    s1_surrender_irr = CorrectedIRRCalculator.calculate_irr(cash_flows)
-                
-                # 方案2的退保IRR
-                s2_surrender_irr = 0
-                if policy_year in s2_surrender_values:
-                    surrender_value = s2_surrender_values[policy_year]
-                    cash_flows = CorrectedIRRCalculator.build_cash_flows_for_surrender(
-                        s2_annual_premium, s2_payment_period, policy_year, surrender_value
-                    )
-                    s2_surrender_irr = CorrectedIRRCalculator.calculate_irr(cash_flows)
-                
-                # 方案1的提取方案IRR
-                s1_withdrawal_irr = 0
-                s1_cumulative_withdrawal = 0
-                if s1_withdrawal_values and policy_year in s1_surrender_values:
-                    # 计算累计提取金额
-                    start_year = min(s1_withdrawal_values.keys())
-                    annual_withdrawal = sum(s1_withdrawal_values.values()) / len(s1_withdrawal_values)
-                    withdrawal_years = policy_year - start_year
-                    s1_cumulative_withdrawal = annual_withdrawal * withdrawal_years if withdrawal_years > 0 else 0
-                    
-                    # 计算最终退保价值
-                    final_surrender_value = s1_surrender_values[policy_year]
-                    
-                    # 构建现金流并计算IRR
-                    cash_flows = CorrectedIRRCalculator.build_cash_flows_for_withdrawal(
-                        s1_annual_premium, s1_payment_period, policy_year, 
-                        start_year, annual_withdrawal, final_surrender_value
-                    )
-                    s1_withdrawal_irr = CorrectedIRRCalculator.calculate_irr(cash_flows)
-                
-                # 方案2的提取方案IRR
-                s2_withdrawal_irr = 0
-                s2_cumulative_withdrawal = 0
-                if s2_withdrawal_values and policy_year in s2_surrender_values:
-                    # 计算累计提取金额
-                    start_year = min(s2_withdrawal_values.keys())
-                    annual_withdrawal = sum(s2_withdrawal_values.values()) / len(s2_withdrawal_values)
-                    withdrawal_years = policy_year - start_year
-                    s2_cumulative_withdrawal = annual_withdrawal * withdrawal_years if withdrawal_years > 0 else 0
-                    
-                    # 计算最终退保价值
-                    final_surrender_value = s2_surrender_values[policy_year]
-                    
-                    # 构建现金流并计算IRR
-                    cash_flows = CorrectedIRRCalculator.build_cash_flows_for_withdrawal(
-                        s2_annual_premium, s2_payment_period, policy_year, 
-                        start_year, annual_withdrawal, final_surrender_value
-                    )
-                    s2_withdrawal_irr = CorrectedIRRCalculator.calculate_irr(cash_flows)
-                
-                # 添加结果
-                results.append({
-                    'policy_year': policy_year,
-                    'scheme1_surrender_value': s1_surrender_values.get(policy_year, 0),
-                    'scheme1_surrender_irr': s1_surrender_irr,
-                    'scheme1_cumulative_withdrawal': s1_cumulative_withdrawal,
-                    'scheme1_withdrawal_irr': s1_withdrawal_irr,
-                    'scheme2_surrender_value': s2_surrender_values.get(policy_year, 0),
-                    'scheme2_surrender_irr': s2_surrender_irr,
-                    'scheme2_cumulative_withdrawal': s2_cumulative_withdrawal,
-                    'scheme2_withdrawal_irr': s2_withdrawal_irr
-                })
-            
-            # 创建结果数据框
-            irr_df = pd.DataFrame(results)
-            
-            # 显示结果
-            print("IRR计算结果:")
-            print(irr_df[['policy_year', 'scheme1_surrender_irr', 'scheme2_surrender_irr']])
-            
-            # 保存结果
-            with pd.ExcelWriter(self.irr_results_file) as writer:
-                df.to_excel(writer, sheet_name='原始数据', index=False)
-                irr_df.to_excel(writer, sheet_name='IRR计算结果', index=False)
-            
-            print(f"IRR计算完成，结果已保存到: {self.irr_results_file}")
-            
-            return irr_df
+        # 创建IRR计算器
+        irr_calculator = CorrectedIRRCalculator()
         
+        try:
+            # 为每种方案计算IRR
+            for scheme_idx, prefix in enumerate(['scheme1', 'scheme2']):
+                annual_premium = df.iloc[0][f'{prefix}_annual_premium']
+                payment_period = df.iloc[0][f'{prefix}_payment_period']
+                surrender_values = df.iloc[0][f'{prefix}_surrender_values']
+                withdrawal_values = df.iloc[0][f'{prefix}_withdrawal_values']
+                
+                # 打印基本信息
+                print(f"\n方案{scheme_idx + 1}基本信息:")
+                print(f"  年缴保费: {annual_premium}")
+                print(f"  缴费期: {payment_period}年")
+                print(f"  退保价值条目数: {len(surrender_values)}")
+                print(f"  提取方案条目数: {len(withdrawal_values)}")
+                
+                # 计算10年、15年、20年退保的IRR
+                for policy_year in [10, 15, 20]:
+                    if policy_year in surrender_values:
+                        surrender_value = surrender_values[policy_year]
+                        cash_flows = irr_calculator.build_cash_flows_for_surrender(
+                            annual_premium=annual_premium,
+                            payment_period=payment_period,
+                            policy_year=policy_year,
+                            surrender_value=surrender_value
+                        )
+                        
+                        irr = irr_calculator.calculate_irr(cash_flows) * 100  # 转换为百分比
+                        df.loc[0, f'{prefix}_surrender_irr_{policy_year}y'] = irr
+                        
+                        print(f"  {policy_year}年退保IRR: {irr:.2f}%")
+                
+                # 计算最优领取方案的IRR
+                if withdrawal_values:
+                    # 找到领取开始年份
+                    withdrawal_start_year = min(withdrawal_values.keys())
+                    
+                    # 处理不同的退保终止年份
+                    for policy_year in [25, 30]:
+                        # 仅计算大于领取开始年份的退保年份
+                        if withdrawal_start_year >= policy_year:
+                            continue
+                            
+                        # 找到最接近的退保价值年份
+                        available_years = [y for y in surrender_values.keys() if y >= policy_year]
+                        if not available_years:
+                            continue
+                            
+                        closest_year = min(available_years, key=lambda y: abs(y - policy_year))
+                        final_surrender_value = surrender_values[closest_year]
+                        
+                        # 计算从领取开始到退保前一年的平均年提取金额
+                        withdrawal_years = [y for y in withdrawal_values.keys() 
+                                          if y >= withdrawal_start_year and y < policy_year]
+                        if not withdrawal_years:
+                            continue
+                            
+                        annual_withdrawal = sum(withdrawal_values[y] for y in withdrawal_years) / len(withdrawal_years)
+                        
+                        # 构建现金流
+                        cash_flows = irr_calculator.build_cash_flows_for_withdrawal(
+                            annual_premium=annual_premium,
+                            payment_period=payment_period,
+                            policy_year=policy_year,
+                            withdrawal_start_year=withdrawal_start_year,
+                            annual_withdrawal=annual_withdrawal,
+                            final_surrender_value=final_surrender_value
+                        )
+                        
+                        irr = irr_calculator.calculate_irr(cash_flows) * 100  # 转换为百分比
+                        df.loc[0, f'{prefix}_withdrawal_irr_{policy_year}y'] = irr
+                        
+                        print(f"  {policy_year}年领取+退保IRR: {irr:.2f}%")
+            
+            # 保存计算结果
+            df.to_excel(self.irr_results_file, index=False)
+            print(f"IRR计算完成，已保存到: {self.irr_results_file}")
+            
+            return df
+            
         except Exception as e:
-            logger.error(f"IRR计算失败: {e}")
+            logger.error(f"计算IRR时出错: {e}")
             import traceback
             traceback.print_exc()
-            return pd.DataFrame()
+            return df
     
-    def calculate_cumulative_withdrawal(self, irr_df: pd.DataFrame) -> pd.DataFrame:
-        """计算累计领取金额，更新到IRR结果表"""
-        if irr_df.empty:
-            return irr_df
-        
-        # 计算每年累计领取金额（根据withdrawal_irr不为0的第一年开始累计）
-        s1_withdrawal_start = False
-        s2_withdrawal_start = False
-        s1_annual_avg = 0
-        s2_annual_avg = 0
-        
-        # 计算年平均提取金额（从首次不为0的withdrawal_irr开始）
-        for idx, row in irr_df.iterrows():
-            if not s1_withdrawal_start and row['scheme1_withdrawal_irr'] != 0:
-                s1_withdrawal_start = True
-                s1_annual_avg = row['scheme1_cumulative_withdrawal'] / (row['policy_year'] - irr_df.loc[0, 'policy_year'])
+    def calculate_cumulative_withdrawal(self, df: pd.DataFrame) -> pd.DataFrame:
+        """计算累计领取金额"""
+        try:
+            for prefix in ['scheme1', 'scheme2']:
+                withdrawal_values = df.iloc[0][f'{prefix}_withdrawal_values']
+                if not withdrawal_values:
+                    continue
+                
+                # 计算不同时间点的累计领取金额
+                years = sorted(withdrawal_values.keys())
+                cumulative = {}
+                
+                running_sum = 0
+                for year in years:
+                    running_sum += withdrawal_values[year]
+                    cumulative[year] = running_sum
+                
+                df.loc[0, f'{prefix}_cumulative_withdrawal'] = cumulative
+                
+                # 计算20年和30年的累计领取金额
+                for target_year in [20, 30]:
+                    eligible_years = [y for y in years if y <= target_year]
+                    if eligible_years:
+                        cum_amount = sum(withdrawal_values[y] for y in eligible_years)
+                        df.loc[0, f'{prefix}_cumulative_withdrawal_{target_year}y'] = cum_amount
+                        print(f"  {prefix} {target_year}年累计领取: {cum_amount}")
             
-            if not s2_withdrawal_start and row['scheme2_withdrawal_irr'] != 0:
-                s2_withdrawal_start = True
-                s2_annual_avg = row['scheme2_cumulative_withdrawal'] / (row['policy_year'] - irr_df.loc[0, 'policy_year'])
-        
-        # 重新计算累计提取金额
-        for idx, row in irr_df.iterrows():
-            policy_year = row['policy_year']
-            start_year = irr_df.loc[0, 'policy_year']
+            return df
             
-            # 方案1
-            if s1_withdrawal_start and row['scheme1_withdrawal_irr'] != 0:
-                years = policy_year - start_year
-                irr_df.at[idx, 'scheme1_cumulative_withdrawal'] = s1_annual_avg * years
-            
-            # 方案2
-            if s2_withdrawal_start and row['scheme2_withdrawal_irr'] != 0:
-                years = policy_year - start_year
-                irr_df.at[idx, 'scheme2_cumulative_withdrawal'] = s2_annual_avg * years
-        
-        return irr_df
+        except Exception as e:
+            logger.error(f"计算累计领取金额时出错: {e}")
+            return df
     
     def step3_generate_html(self, irr_df: pd.DataFrame) -> str:
-        """步骤3: 生成HTML可视化报告"""
-        print("\n=== 步骤3: HTML报告生成 ===")
+        """步骤3: 生成HTML报告"""
+        print("\n=== 步骤3: 生成HTML报告 ===")
         
         if irr_df.empty:
             print("错误: 无数据可生成HTML报告")
             return ""
         
         try:
-            # 读取原始数据
-            raw_df = pd.read_excel(self.extracted_data_file)
+            # 检查HTML模板是否存在
+            if os.path.exists(self.html_template_path):
+                print(f"找到HTML模板文件: {self.html_template_path}")
+                with open(self.html_template_path, 'r', encoding='utf-8') as f:
+                    template_html = f.read()
+            else:
+                print("错误: HTML模板文件不存在")
+                return ""
             
-            # 提取方案名称和信息
-            scheme1_name = raw_df['scheme1_name'].iloc[0]
-            scheme1_premium = raw_df['scheme1_annual_premium'].iloc[0]
-            scheme1_payment = raw_df['scheme1_payment_period'].iloc[0]
-            scheme1_currency = raw_df['scheme1_currency'].iloc[0]
+            # 提取基本信息
+            scheme1_name = irr_df.iloc[0].get('scheme1_name', 'VIP先生')
+            scheme1_age = irr_df.iloc[0].get('scheme1_age', 45)
+            scheme1_currency = irr_df.iloc[0].get('scheme1_currency', '美元')
+            scheme1_annual_premium = irr_df.iloc[0].get('scheme1_annual_premium', 50000)
+            scheme1_payment_period = irr_df.iloc[0].get('scheme1_payment_period', 5)
+            scheme1_total_premium = irr_df.iloc[0].get('scheme1_total_premium', 250000)
             
-            scheme2_name = raw_df['scheme2_name'].iloc[0]
-            scheme2_premium = raw_df['scheme2_annual_premium'].iloc[0]
-            scheme2_payment = raw_df['scheme2_payment_period'].iloc[0]
-            scheme2_currency = raw_df['scheme2_currency'].iloc[0]
+            scheme2_name = irr_df.iloc[0].get('scheme2_name', 'VIP先生')
+            scheme2_age = irr_df.iloc[0].get('scheme2_age', 45)
+            scheme2_currency = irr_df.iloc[0].get('scheme2_currency', '美元')
+            scheme2_annual_premium = irr_df.iloc[0].get('scheme2_annual_premium', 50000)
+            scheme2_payment_period = irr_df.iloc[0].get('scheme2_payment_period', 5)
+            scheme2_total_premium = irr_df.iloc[0].get('scheme2_total_premium', 250000)
             
-            # 准备图表数据
-            years = irr_df['policy_year'].tolist()
-            s1_surrender_values = irr_df['scheme1_surrender_value'].tolist()
-            s2_surrender_values = irr_df['scheme2_surrender_value'].tolist()
-            s1_surrender_irrs = irr_df['scheme1_surrender_irr'].tolist()
-            s2_surrender_irrs = irr_df['scheme2_surrender_irr'].tolist()
+            # 提取IRR数据
+            scheme1_surrender_irr_10y = irr_df.iloc[0].get('scheme1_surrender_irr_10y', 0)
+            scheme1_surrender_irr_15y = irr_df.iloc[0].get('scheme1_surrender_irr_15y', 0)
+            scheme1_surrender_irr_20y = irr_df.iloc[0].get('scheme1_surrender_irr_20y', 0)
+            scheme1_withdrawal_irr_25y = irr_df.iloc[0].get('scheme1_withdrawal_irr_25y', 0)
+            scheme1_withdrawal_irr_30y = irr_df.iloc[0].get('scheme1_withdrawal_irr_30y', 0)
             
-            # 生成报告HTML
-            html_content = f"""
-            <!DOCTYPE html>
-            <html lang="zh-CN">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>保险方案对比分析报告</title>
-                <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-                <style>
-                    body {{
-                        font-family: 'Arial', 'Microsoft YaHei', sans-serif;
-                        line-height: 1.6;
-                        color: #333;
-                        margin: 0;
-                        padding: 0;
-                        background-color: #f8f9fa;
-                    }}
-                    .container {{
-                        max-width: 1200px;
-                        margin: 0 auto;
-                        padding: 20px;
-                        background-color: white;
-                        box-shadow: 0 0 10px rgba(0,0,0,0.1);
-                    }}
-                    h1, h2, h3, h4 {{
-                        color: #2c3e50;
-                    }}
-                    h1 {{
-                        text-align: center;
-                        margin-bottom: 30px;
-                        padding-bottom: 15px;
-                        border-bottom: 2px solid #e9ecef;
-                    }}
-                    .summary-box {{
-                        background-color: #f8f9fa;
-                        border-left: 4px solid #0275d8;
-                        padding: 15px;
-                        margin-bottom: 20px;
-                    }}
-                    .chart-container {{
-                        position: relative;
-                        height: 400px;
-                        margin-bottom: 30px;
-                    }}
-                    table {{
-                        width: 100%;
-                        border-collapse: collapse;
-                        margin-bottom: 20px;
-                    }}
-                    th, td {{
-                        padding: 12px 15px;
-                        text-align: left;
-                        border-bottom: 1px solid #e9ecef;
-                    }}
-                    th {{
-                        background-color: #f1f3f5;
-                        font-weight: bold;
-                    }}
-                    tr:hover {{
-                        background-color: #f8f9fa;
-                    }}
-                    .highlight {{
-                        background-color: #e9f7ef;
-                        font-weight: bold;
-                    }}
-                    .footer {{
-                        text-align: center;
-                        margin-top: 30px;
-                        padding-top: 15px;
-                        color: #6c757d;
-                        font-size: 0.9em;
-                        border-top: 1px solid #e9ecef;
-                    }}
-                    .scheme1-color {{
-                        color: #3498db;
-                    }}
-                    .scheme2-color {{
-                        color: #e74c3c;
-                    }}
-                    .flex-container {{
-                        display: flex;
-                        justify-content: space-between;
-                        flex-wrap: wrap;
-                    }}
-                    .info-box {{
-                        flex: 1;
-                        min-width: 300px;
-                        margin: 10px;
-                        padding: 15px;
-                        background-color: #f8f9fa;
-                        border-radius: 5px;
-                    }}
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>保险方案IRR对比分析报告</h1>
-                    
-                    <div class="summary-box">
-                        <h3>方案摘要</h3>
-                        <div class="flex-container">
-                            <div class="info-box">
-                                <h4 class="scheme1-color">方案1: {scheme1_name}</h4>
-                                <p>年缴保费: {scheme1_currency} {scheme1_premium:,.0f}</p>
-                                <p>缴费期: {scheme1_payment} 年</p>
-                                <p>总保费: {scheme1_currency} {scheme1_premium * scheme1_payment:,.0f}</p>
-                            </div>
-                            <div class="info-box">
-                                <h4 class="scheme2-color">方案2: {scheme2_name}</h4>
-                                <p>年缴保费: {scheme2_currency} {scheme2_premium:,.0f}</p>
-                                <p>缴费期: {scheme2_payment} 年</p>
-                                <p>总保费: {scheme2_currency} {scheme2_premium * scheme2_payment:,.0f}</p>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <h2>退保价值对比</h2>
-                    <div class="chart-container">
-                        <canvas id="surrenderValueChart"></canvas>
-                    </div>
-                    
-                    <h2>IRR对比</h2>
-                    <div class="chart-container">
-                        <canvas id="irrChart"></canvas>
-                    </div>
-                    
-                    <h2>详细数据对比</h2>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>保单年度</th>
-                                <th>方案1退保价值({scheme1_currency})</th>
-                                <th>方案1 IRR(%)</th>
-                                <th>方案2退保价值({scheme2_currency})</th>
-                                <th>方案2 IRR(%)</th>
-                                <th>差额({scheme1_currency})</th>
-                                <th>IRR差异(%)</th>
-                            </tr>
-                        </thead>
-                        <tbody>
+            scheme2_surrender_irr_10y = irr_df.iloc[0].get('scheme2_surrender_irr_10y', 0)
+            scheme2_surrender_irr_15y = irr_df.iloc[0].get('scheme2_surrender_irr_15y', 0)
+            scheme2_surrender_irr_20y = irr_df.iloc[0].get('scheme2_surrender_irr_20y', 0)
+            scheme2_withdrawal_irr_25y = irr_df.iloc[0].get('scheme2_withdrawal_irr_25y', 0)
+            scheme2_withdrawal_irr_30y = irr_df.iloc[0].get('scheme2_withdrawal_irr_30y', 0)
+            
+            # 提取退保价值数据
+            scheme1_surrender_values = irr_df.iloc[0].get('scheme1_surrender_values', {})
+            scheme2_surrender_values = irr_df.iloc[0].get('scheme2_surrender_values', {})
+            
+            # 提取领取方案数据
+            scheme1_withdrawal_values = irr_df.iloc[0].get('scheme1_withdrawal_values', {})
+            scheme2_withdrawal_values = irr_df.iloc[0].get('scheme2_withdrawal_values', {})
+            
+            # 提取累计领取金额
+            scheme1_cum_withdrawal_20y = irr_df.iloc[0].get('scheme1_cumulative_withdrawal_20y', 0)
+            scheme1_cum_withdrawal_30y = irr_df.iloc[0].get('scheme1_cumulative_withdrawal_30y', 0)
+            scheme2_cum_withdrawal_20y = irr_df.iloc[0].get('scheme2_cumulative_withdrawal_20y', 0)
+            scheme2_cum_withdrawal_30y = irr_df.iloc[0].get('scheme2_cumulative_withdrawal_30y', 0)
+            
+            # 计算IRR差值
+            irr_diff_10y = scheme1_surrender_irr_10y - scheme2_surrender_irr_10y
+            irr_diff_15y = scheme1_surrender_irr_15y - scheme2_surrender_irr_15y
+            irr_diff_20y = scheme1_surrender_irr_20y - scheme2_surrender_irr_20y
+            irr_diff_25y = scheme1_withdrawal_irr_25y - scheme2_withdrawal_irr_25y
+            irr_diff_30y = scheme1_withdrawal_irr_30y - scheme2_withdrawal_irr_30y
+            
+            # 生成IRR对比HTML
+            irr_comparison_html = f"""
+            <tr><th>10年退保</th><td>{scheme1_surrender_irr_10y:.2f}%</td><td>{scheme2_surrender_irr_10y:.2f}%</td><td>{irr_diff_10y:.2f}%</td></tr>
+            <tr><th>15年退保</th><td>{scheme1_surrender_irr_15y:.2f}%</td><td>{scheme2_surrender_irr_15y:.2f}%</td><td>{irr_diff_15y:.2f}%</td></tr>
+            <tr><th>20年退保</th><td>{scheme1_surrender_irr_20y:.2f}%</td><td>{scheme2_surrender_irr_20y:.2f}%</td><td>{irr_diff_20y:.2f}%</td></tr>
+            <tr><th>25年领取+退保</th><td>{scheme1_withdrawal_irr_25y:.2f}%</td><td>{scheme2_withdrawal_irr_25y:.2f}%</td><td>{irr_diff_25y:.2f}%</td></tr>
+            <tr><th>30年领取+退保</th><td>{scheme1_withdrawal_irr_30y:.2f}%</td><td>{scheme2_withdrawal_irr_30y:.2f}%</td><td>{irr_diff_30y:.2f}%</td></tr>
             """
             
-            # 添加数据行
-            for i, row in irr_df.iterrows():
-                year = row['policy_year']
-                s1_value = row['scheme1_surrender_value']
-                s1_irr = row['scheme1_surrender_irr'] * 100  # 转换为百分比
-                s2_value = row['scheme2_surrender_value']
-                s2_irr = row['scheme2_surrender_irr'] * 100  # 转换为百分比
-                value_diff = s1_value - s2_value
-                irr_diff = s1_irr - s2_irr
+            # 生成退保价值对比表格HTML
+            surrender_years = sorted(set(list(scheme1_surrender_values.keys()) + list(scheme2_surrender_values.keys())))
+            surrender_table_rows = []
+            
+            for year in surrender_years:
+                scheme1_value = scheme1_surrender_values.get(year, 0)
+                scheme2_value = scheme2_surrender_values.get(year, 0)
+                value_diff = scheme1_value - scheme2_value
                 
-                # 判断哪个方案更好
-                row_class = ""
-                if s1_irr > s2_irr:
-                    row_class = "highlight"
+                # 计算回本率
+                scheme1_return_rate = (scheme1_value / scheme1_total_premium * 100) if scheme1_total_premium else 0
+                scheme2_return_rate = (scheme2_value / scheme2_total_premium * 100) if scheme2_total_premium else 0
+                return_rate_diff = scheme1_return_rate - scheme2_return_rate
                 
-                html_content += f"""
-                    <tr class="{row_class}">
-                        <td>{year}</td>
-                        <td>{s1_value:,.2f}</td>
-                        <td>{s1_irr:.2f}%</td>
-                        <td>{s2_value:,.2f}</td>
-                        <td>{s2_irr:.2f}%</td>
-                        <td>{value_diff:,.2f}</td>
-                        <td>{irr_diff:.2f}%</td>
-                    </tr>
+                row = f"""
+                <tr>
+                    <td>{year}</td>
+                    <td>{scheme1_value:,.0f}</td>
+                    <td>{scheme2_value:,.0f}</td>
+                    <td>{value_diff:,.0f}</td>
+                    <td>{scheme1_return_rate:.2f}%</td>
+                    <td>{scheme2_return_rate:.2f}%</td>
+                    <td>{return_rate_diff:.2f}%</td>
+                </tr>
                 """
+                surrender_table_rows.append(row)
             
-            # 添加图表脚本和页脚
-            html_content += f"""
-                        </tbody>
-                    </table>
-                    
-                    <div class="footer">
-                        <p>报告生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                        <p>报告ID: {self.task_id}</p>
-                        <p>本报告仅用于保险产品对比参考，不构成任何投资或购买建议。</p>
-                    </div>
-                </div>
+            surrender_comparison_html = "\n".join(surrender_table_rows)
+            
+            # 生成领取方案对比表格HTML
+            withdrawal_years = sorted(set(list(scheme1_withdrawal_values.keys()) + list(scheme2_withdrawal_values.keys())))
+            withdrawal_table_rows = []
+            
+            # 初始化累计数据
+            scheme1_cum = 0
+            scheme2_cum = 0
+            
+            for year in withdrawal_years:
+                scheme1_value = scheme1_withdrawal_values.get(year, 0)
+                scheme2_value = scheme2_withdrawal_values.get(year, 0)
+                value_diff = scheme1_value - scheme2_value
                 
-                <script>
-                    // 退保价值图表
-                    const valueCtx = document.getElementById('surrenderValueChart').getContext('2d');
-                    const valueChart = new Chart(valueCtx, {{
-                        type: 'line',
-                        data: {{
-                            labels: {years},
-                            datasets: [
-                                {{
-                                    label: '方案1 退保价值',
-                                    data: {s1_surrender_values},
-                                    backgroundColor: 'rgba(52, 152, 219, 0.2)',
-                                    borderColor: 'rgba(52, 152, 219, 1)',
-                                    borderWidth: 2,
-                                    pointBackgroundColor: 'rgba(52, 152, 219, 1)',
-                                    tension: 0.4
-                                }},
-                                {{
-                                    label: '方案2 退保价值',
-                                    data: {s2_surrender_values},
-                                    backgroundColor: 'rgba(231, 76, 60, 0.2)',
-                                    borderColor: 'rgba(231, 76, 60, 1)',
-                                    borderWidth: 2,
-                                    pointBackgroundColor: 'rgba(231, 76, 60, 1)',
-                                    tension: 0.4
-                                }}
-                            ]
-                        }},
-                        options: {{
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            plugins: {{
-                                legend: {{
-                                    position: 'top',
-                                }},
-                                title: {{
-                                    display: true,
-                                    text: '保单年度退保价值对比'
-                                }}
-                            }},
-                            scales: {{
-                                y: {{
-                                    beginAtZero: true,
-                                    title: {{
-                                        display: true,
-                                        text: '退保价值 ({scheme1_currency})'
-                                    }}
-                                }},
-                                x: {{
-                                    title: {{
-                                        display: true,
-                                        text: '保单年度'
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }});
-                    
-                    // IRR图表
-                    const irrCtx = document.getElementById('irrChart').getContext('2d');
-                    const irrChart = new Chart(irrCtx, {{
-                        type: 'line',
-                        data: {{
-                            labels: {years},
-                            datasets: [
-                                {{
-                                    label: '方案1 IRR',
-                                    data: {[x * 100 for x in s1_surrender_irrs]},
-                                    backgroundColor: 'rgba(52, 152, 219, 0.2)',
-                                    borderColor: 'rgba(52, 152, 219, 1)',
-                                    borderWidth: 2,
-                                    pointBackgroundColor: 'rgba(52, 152, 219, 1)',
-                                    tension: 0.4
-                                }},
-                                {{
-                                    label: '方案2 IRR',
-                                    data: {[x * 100 for x in s2_surrender_irrs]},
-                                    backgroundColor: 'rgba(231, 76, 60, 0.2)',
-                                    borderColor: 'rgba(231, 76, 60, 1)',
-                                    borderWidth: 2,
-                                    pointBackgroundColor: 'rgba(231, 76, 60, 1)',
-                                    tension: 0.4
-                                }}
-                            ]
-                        }},
-                        options: {{
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            plugins: {{
-                                legend: {{
-                                    position: 'top',
-                                }},
-                                title: {{
-                                    display: true,
-                                    text: '保单年度IRR对比'
-                                }}
-                            }},
-                            scales: {{
-                                y: {{
-                                    beginAtZero: true,
-                                    title: {{
-                                        display: true,
-                                        text: 'IRR (%)'
-                                    }}
-                                }},
-                                x: {{
-                                    title: {{
-                                        display: true,
-                                        text: '保单年度'
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }});
-                </script>
-            </body>
-            </html>
+                # 计算累计领取金额
+                scheme1_cum += scheme1_value
+                scheme2_cum += scheme2_value
+                cum_diff = scheme1_cum - scheme2_cum
+                
+                row = f"""
+                <tr>
+                    <td>{year}</td>
+                    <td>{scheme1_value:,.0f}</td>
+                    <td>{scheme2_value:,.0f}</td>
+                    <td>{value_diff:,.0f}</td>
+                    <td>{scheme1_cum:,.0f}</td>
+                    <td>{scheme2_cum:,.0f}</td>
+                    <td>{cum_diff:,.0f}</td>
+                </tr>
+                """
+                withdrawal_table_rows.append(row)
+            
+            withdrawal_comparison_html = "\n".join(withdrawal_table_rows)
+            
+            # 生成累计领取金额HTML
+            cumulative_withdrawal_html = f"""
+            <tr><th>20年累计领取</th><td>{scheme1_cum_withdrawal_20y:,.0f}</td><td>{scheme2_cum_withdrawal_20y:,.0f}</td><td>{scheme1_cum_withdrawal_20y - scheme2_cum_withdrawal_20y:,.0f}</td></tr>
+            <tr><th>30年累计领取</th><td>{scheme1_cum_withdrawal_30y:,.0f}</td><td>{scheme2_cum_withdrawal_30y:,.0f}</td><td>{scheme1_cum_withdrawal_30y - scheme2_cum_withdrawal_30y:,.0f}</td></tr>
             """
             
-            # 保存HTML文件
+            # 获取当前日期
+            current_date = datetime.now().strftime("%Y-%m-%d")
+            
+            # 替换模板中的占位符
+            html_content = template_html.replace("{{currentDate}}", current_date)
+            
+            # 基本信息替换
+            html_content = html_content.replace("{{customerName}}", scheme1_name)
+            html_content = html_content.replace("{{customerAge}}", str(scheme1_age))
+            
+            # 方案1信息替换
+            html_content = html_content.replace("{{scheme1Currency}}", scheme1_currency)
+            html_content = html_content.replace("{{scheme1AnnualPremium}}", f"{scheme1_annual_premium:,.0f}")
+            html_content = html_content.replace("{{scheme1PaymentPeriod}}", str(scheme1_payment_period))
+            html_content = html_content.replace("{{scheme1TotalPremium}}", f"{scheme1_total_premium:,.0f}")
+            
+            # 方案2信息替换
+            html_content = html_content.replace("{{scheme2Currency}}", scheme2_currency)
+            html_content = html_content.replace("{{scheme2AnnualPremium}}", f"{scheme2_annual_premium:,.0f}")
+            html_content = html_content.replace("{{scheme2PaymentPeriod}}", str(scheme2_payment_period))
+            html_content = html_content.replace("{{scheme2TotalPremium}}", f"{scheme2_total_premium:,.0f}")
+            
+            # 表格数据替换
+            html_content = html_content.replace("{{irrComparisonRows}}", irr_comparison_html)
+            html_content = html_content.replace("{{surrenderValueRows}}", surrender_comparison_html)
+            html_content = html_content.replace("{{withdrawalPlanRows}}", withdrawal_comparison_html)
+            html_content = html_content.replace("{{cumulativeWithdrawalRows}}", cumulative_withdrawal_html)
+            
+            # 方案3数据处理 - 可选特性
+            # 这里我们处理报告中的方案3部分，将其设置为与方案1相同（或者隐藏）
+            # 因为我们只有方案1和方案2的数据
+            html_content = html_content.replace("{{scheme3Currency}}", scheme1_currency)
+            html_content = html_content.replace("{{scheme3AnnualPremium}}", f"{scheme1_annual_premium:,.0f}")
+            html_content = html_content.replace("{{scheme3PaymentPeriod}}", str(scheme1_payment_period))
+            html_content = html_content.replace("{{scheme3TotalPremium}}", f"{scheme1_total_premium:,.0f}")
+            
+            # 保存HTML报告
             with open(self.final_html_file, 'w', encoding='utf-8') as f:
                 f.write(html_content)
             
-            print(f"HTML报告生成完成: {self.final_html_file}")
+            print(f"HTML报告生成完成，已保存到: {self.final_html_file}")
             
             return self.final_html_file
             
         except Exception as e:
-            logger.error(f"生成HTML报告失败: {e}")
+            logger.error(f"生成HTML报告时出错: {e}")
             import traceback
             traceback.print_exc()
             return ""
     
     async def step4_generate_screenshot(self, html_file: str) -> str:
-        """步骤4: 生成截图（异步版本，增强的错误处理）"""
-        print("\n=== 步骤4: 截图生成 ===")
+        """步骤4: 生成网页截图"""
+        print("\n=== 步骤4: 生成网页截图 ===")
         
         if not html_file or not os.path.exists(html_file):
-            print(f"错误: HTML文件不存在 - {html_file}")
+            print("错误: HTML文件不存在，无法生成截图")
             return ""
         
-        # 检查是否已安装Playwright
         if not PLAYWRIGHT_AVAILABLE:
-            print("警告: Playwright未安装，无法生成截图")
+            print("错误: Playwright未安装，无法生成截图")
             return ""
         
         try:
-            # 检查Playwright浏览器是否已安装
-            try:
-                from playwright.async_api import async_playwright
+            # 使用Playwright异步API
+            async with async_playwright() as p:
+                # 启动浏览器
+                browser = await p.chromium.launch()
                 
-                async with async_playwright() as playwright:
-                    # 尝试启动浏览器，可能会失败如果二进制文件不存在
-                    try:
-                        browser = await playwright.chromium.launch(
-                            headless=True,
-                            args=[
-                                '--no-sandbox',
-                                '--disable-setuid-sandbox',
-                                '--disable-dev-shm-usage',
-                                '--disable-accelerated-2d-canvas',
-                                '--no-first-run',
-                                '--no-zygote',
-                                '--single-process',
-                                '--disable-gpu'
-                            ]
-                        )
-                        
-                        # 浏览器启动成功，继续截图流程
-                        context = await browser.new_context(
-                            viewport={'width': 1200, 'height': 1600},
-                            device_scale_factor=2
-                        )
-                        page = await context.new_page()
-                        
-                        # 加载HTML文件
-                        file_url = f"file://{os.path.abspath(html_file)}"
-                        print(f"加载HTML文件: {file_url}")
-                        await page.goto(file_url)
-                        
-                        # 等待页面完全加载
-                        await page.wait_for_load_state("networkidle")
-                        await page.wait_for_load_state("domcontentloaded")
-                        await asyncio.sleep(3)  # 额外等待确保所有样式加载完成 (异步等待)
-                        
-                        # 滚动到顶部确保内容可见
-                        await page.evaluate("window.scrollTo(0, 0)")
-                        await asyncio.sleep(1)  # 异步等待
-                        
-                        # 尝试定位主要内容容器，使用多种选择器
-                        container_selectors = [
-                            '.container',  # 常见的容器类名
-                            '.content',    # 内容容器
-                            'main',        # HTML5语义标签
-                            'body > div:first-child',  # body下第一个div
-                            'body > div',  # body下的div
-                            'body'         # 最后回退到body
-                        ]
-                        
-                        container_found = False
-                        for selector in container_selectors:
-                            try:
-                                # 检查元素是否存在且可见
-                                element = page.locator(selector).first
-                                count = await element.count()
-                                if count > 0:
-                                    # 检查元素是否有实际内容
-                                    bounding_box = await element.bounding_box()
-                                    if bounding_box and bounding_box['width'] > 100 and bounding_box['height'] > 100:
-                                        print(f"找到主要容器: {selector}")
-                                        print(f"容器尺寸: {bounding_box}")
-                                        
-                                        # 直接截取容器元素，不需要手动裁剪
-                                        print(f"正在生成超高分辨率截图...")
-                                        await element.screenshot(
-                                            path=self.final_screenshot_file,
-                                            type='png'
-                                        )
-                                        
-                                        container_found = True
-                                        break
-                            except Exception as e:
-                                print(f"尝试选择器 '{selector}' 时出错: {e}")
-                                continue
-                        
-                        # 如果没有找到合适的容器，回退到全页面截图
-                        if not container_found:
-                            print("未找到合适的容器，使用全页面截图...")
-                            await page.screenshot(
-                                path=self.final_screenshot_file,
-                                full_page=True,
-                                type='png'
-                            )
-                        
-                        await browser.close()
-                        
-                        print(f"超高质量截图生成完成: {self.final_screenshot_file}")
-                        
-                        # 验证截图文件
-                        if os.path.exists(self.final_screenshot_file):
-                            file_size = os.path.getsize(self.final_screenshot_file)
-                            print(f"截图文件大小: {file_size:,} 字节")
-                            return self.final_screenshot_file
-                        else:
-                            print("错误: 截图文件未生成")
-                            return ""
-                    
-                    except Exception as browser_error:
-                        # 浏览器启动失败
-                        print(f"生成截图时出错: {browser_error}")
-                        import traceback
-                        traceback.print_exc()
-                        print("警告: 截图生成失败，但其他步骤已完成")
-                        return ""
-            
-            except ImportError as import_error:
-                # Playwright导入失败
-                print(f"无法导入Playwright模块: {import_error}")
-                print("警告: 截图生成失败，但其他步骤已完成")
-                return ""
-            
+                # 创建新页面
+                page = await browser.new_page()
+                
+                # 设置视口大小
+                await page.set_viewport_size({"width": 1280, "height": 1600})
+                
+                # 加载HTML文件
+                file_url = f"file://{os.path.abspath(html_file)}"
+                print(f"加载HTML文件: {file_url}")
+                await page.goto(file_url)
+                
+                # 等待页面加载完成
+                await page.wait_for_load_state("networkidle")
+                
+                # 生成截图
+                await page.screenshot(path=self.final_screenshot_file, full_page=True)
+                
+                # 关闭浏览器
+                await browser.close()
+                
+                print(f"截图生成完成，已保存到: {self.final_screenshot_file}")
+                
+                return self.final_screenshot_file
+                
         except Exception as e:
-            # 其他未预期的错误
-            print(f"生成截图时出错: {e}")
+            logger.error(f"生成截图时出错: {e}")
             import traceback
             traceback.print_exc()
-            print("警告: 截图生成失败，但其他步骤已完成")
             return ""
     
     async def run_complete_pipeline(self) -> Dict[str, str]:
-        """运行完整的端到端流水线，返回结果文件URL"""
-        print("开始执行Railway版本保险数据处理流水线")
-        print("=" * 60)
-        
-        start_time = datetime.now()
-        result_urls = {}
-        
+        """运行完整的处理流水线"""
         try:
             # 步骤1: 提取PDF数据
-            extracted_df = await self.step1_extract_pdf_data()
-            if extracted_df.empty:
+            df = await self.step1_extract_pdf_data()
+            if df.empty:
                 raise Exception("PDF数据提取失败")
             
             # 步骤2: 计算IRR
-            irr_df = self.step2_calculate_irr(extracted_df)
+            irr_df = self.step2_calculate_irr(df)
             
             # 计算累计领取金额
             irr_df = self.calculate_cumulative_withdrawal(irr_df)
@@ -1541,18 +1160,13 @@ class RailwayInsurancePipeline:
             if not html_file:
                 raise Exception("HTML报告生成失败")
             
-            # 步骤4: 生成截图 - 即使失败也继续流程
-            try:
-                screenshot_file = await self.step4_generate_screenshot(html_file)
-            except Exception as screenshot_error:
-                logger.error(f"截图生成失败，但继续执行其他步骤: {screenshot_error}")
-                screenshot_file = ""
-                print("警告: 截图生成失败，但其他步骤将继续")
+            # 步骤4: 生成截图
+            screenshot_file = await self.step4_generate_screenshot(html_file)
             
             # 步骤5: 上传结果到Supabase
+            result_urls = {}
+            
             if self.supabase:
-                print("\n=== 步骤5: 上传结果 ===")
-                
                 # 上传Excel数据
                 excel_url = await self._upload_file_to_supabase(
                     self.irr_results_file,
@@ -1563,22 +1177,23 @@ class RailwayInsurancePipeline:
                 
                 # 上传HTML报告
                 html_url = await self._upload_file_to_supabase(
-                    html_file,
+                    self.final_html_file,
                     f"{self.task_id}/report.html"
                 )
                 if html_url:
                     result_urls['html_url'] = html_url
                 
-                # 上传截图（如果成功生成）
+                # 上传截图
                 if screenshot_file and os.path.exists(screenshot_file):
                     screenshot_url = await self._upload_file_to_supabase(
-                        screenshot_file,
+                        self.final_screenshot_file,
                         f"{self.task_id}/screenshot.png"
                     )
                     if screenshot_url:
                         result_urls['screenshot_url'] = screenshot_url
-                
-                # 更新任务状态
+            
+            # 保存结果到数据库（如果Supabase客户端可用）
+            if self.supabase:
                 try:
                     self.supabase.table('tasks').update({
                         'status': 'completed',
@@ -1586,16 +1201,11 @@ class RailwayInsurancePipeline:
                         'completed_at': datetime.now().isoformat()
                     }).eq('id', self.task_id).execute()
                     print(f"任务结果已更新到数据库: {self.task_id}")
-                except Exception as db_err:
-                    logger.error(f"更新任务状态时出错: {db_err}")
+                except Exception as e:
+                    logger.error(f"更新任务状态时出错: {e}")
             
             # 清理临时文件
             self._cleanup()
-            
-            # 计算处理时间
-            end_time = datetime.now()
-            duration = (end_time - start_time).total_seconds()
-            print(f"\n流水线完成! 处理时间: {duration:.2f} 秒")
             
             return result_urls
             
@@ -1609,7 +1219,7 @@ class RailwayInsurancePipeline:
                 try:
                     self.supabase.table('tasks').update({
                         'status': 'failed',
-                        'error_message': str(e),  # 修复: 使用 error_message 而不是 error
+                        'error_message': str(e),
                         'completed_at': datetime.now().isoformat()
                     }).eq('id', self.task_id).execute()
                     print(f"任务失败状态已更新到数据库: {self.task_id}")
@@ -1619,49 +1229,50 @@ class RailwayInsurancePipeline:
             # 清理临时文件
             self._cleanup()
             
-            # 返回错误信息
+            # 如果是直接API调用，返回错误信息
             return {"error": str(e)}
 
-async def process_insurance_pdfs(pdf_urls, supabase_url=None, supabase_key=None, task_id=None):
-    """处理保险PDF文件的异步函数"""
-    try:
-        # 创建并运行流水线
-        pipeline = RailwayInsurancePipeline(
-            pdf_urls=pdf_urls,
-            supabase_url=supabase_url,
-            supabase_key=supabase_key,
-            task_id=task_id
-        )
-        
-        # 运行完整流水线
-        results = await pipeline.run_complete_pipeline()
-        
-        # 返回结果
-        return results
+async def process_insurance_pdfs(pdf_urls, supabase_url=None, supabase_key=None, task_id=None) -> Dict[str, str]:
+    """
+    处理保险PDF文件并返回结果URLs
     
-    except Exception as e:
-        logger.error(f"处理请求时发生错误: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
+    参数:
+    pdf_urls: PDF文件URL列表（至少2个）
+    supabase_url: Supabase URL（可选）
+    supabase_key: Supabase密钥（可选）
+    task_id: 任务ID（可选，如果未提供将自动生成）
+    
+    返回:
+    Dict[str, str]: 包含生成的文件URLs的字典
+    """
+    # 创建并运行处理流水线
+    pipeline = RailwayInsurancePipeline(
+        pdf_urls=pdf_urls,
+        supabase_url=supabase_url,
+        supabase_key=supabase_key,
+        task_id=task_id
+    )
+    
+    return await pipeline.run_complete_pipeline()
 
-# 如果直接运行脚本，提供简单的测试功能
+# 直接运行测试
 if __name__ == "__main__":
+    # 获取命令行参数
     import argparse
-    
-    parser = argparse.ArgumentParser(description='Railway保险数据处理流水线')
-    parser.add_argument('--pdf1', required=True, help='第一个保险方案PDF的URL')
-    parser.add_argument('--pdf2', required=True, help='第二个保险方案PDF的URL')
-    parser.add_argument('--supabase_url', help='Supabase URL')
-    parser.add_argument('--supabase_key', help='Supabase Key')
-    parser.add_argument('--task_id', help='任务ID')
+    parser = argparse.ArgumentParser(description='处理保险PDF文件')
+    parser.add_argument('--pdf1', type=str, help='第一个PDF文件路径或URL')
+    parser.add_argument('--pdf2', type=str, help='第二个PDF文件路径或URL')
+    parser.add_argument('--supabase_url', type=str, help='Supabase URL')
+    parser.add_argument('--supabase_key', type=str, help='Supabase密钥')
+    parser.add_argument('--task_id', type=str, help='任务ID')
     
     args = parser.parse_args()
     
-    print("启动Railway版本保险数据处理流水线")
-    print(f"   方案1: {args.pdf1}")
-    print(f"   方案2: {args.pdf2}")
+    if not args.pdf1 or not args.pdf2:
+        print("错误: 需要提供两个PDF文件路径或URL")
+        sys.exit(1)
     
+    # 运行处理流水线
     result = asyncio.run(process_insurance_pdfs(
         pdf_urls=[args.pdf1, args.pdf2],
         supabase_url=args.supabase_url,
@@ -1669,5 +1280,6 @@ if __name__ == "__main__":
         task_id=args.task_id
     ))
     
-    print("\n处理结果:")
-    print(result)
+    print("\n=== 处理结果 ===")
+    for key, value in result.items():
+        print(f"{key}: {value}")
